@@ -47,26 +47,35 @@ impl Provider for Claude {
         let credentials = snapshot
             .get("credentials")
             .context("invalid Claude profile: missing \"credentials\"")?;
+
+        // Prepare ~/.claude.json (which holds many other settings; only
+        // oauthAccount is replaced) before writing anything, so a failure
+        // cannot leave new credentials paired with the old account.
+        let config = match read_json(&self.config_path)? {
+            Some(mut config) => {
+                let object = config.as_object_mut().with_context(|| {
+                    format!("{} is not a JSON object", self.config_path.display())
+                })?;
+                match snapshot.get("oauthAccount") {
+                    Some(account) if !account.is_null() => {
+                        object.insert("oauthAccount".to_owned(), account.clone());
+                    }
+                    _ => {
+                        object.shift_remove("oauthAccount");
+                    }
+                }
+                let mode = fs::metadata(&self.config_path)?.permissions().mode() & 0o777;
+                Some((config, mode))
+            }
+            None => None,
+        };
+
         create_private_dir(&self.dir)?;
         write_json(&self.credentials_path(), credentials, 0o600)?;
-
-        // ~/.claude.json holds many other settings: replace only oauthAccount.
-        let Some(mut config) = read_json(&self.config_path)? else {
-            return Ok(());
-        };
-        let object = config
-            .as_object_mut()
-            .with_context(|| format!("{} is not a JSON object", self.config_path.display()))?;
-        match snapshot.get("oauthAccount") {
-            Some(account) if !account.is_null() => {
-                object.insert("oauthAccount".to_owned(), account.clone());
-            }
-            _ => {
-                object.shift_remove("oauthAccount");
-            }
+        if let Some((config, mode)) = config {
+            write_json(&self.config_path, &config, mode)?;
         }
-        let mode = fs::metadata(&self.config_path)?.permissions().mode() & 0o777;
-        write_json(&self.config_path, &config, mode)
+        Ok(())
     }
 
     fn account_id(&self, snapshot: &Value) -> Option<String> {
@@ -203,6 +212,20 @@ mod tests {
         claude.write_live(&snapshot("t", "alice")).unwrap();
         assert!(!home.path().join(".claude.json").exists());
         assert!(claude.write_live(&json!({})).is_err());
+    }
+
+    #[test]
+    fn write_live_changes_nothing_when_config_is_not_an_object() {
+        let home = tempdir().unwrap();
+        let credentials = home.path().join(".claude/.credentials.json");
+        let original = json!({"claudeAiOauth": {"accessToken": "old"}});
+        write(&credentials, &original, 0o600);
+        write(&home.path().join(".claude.json"), &json!([]), 0o600);
+
+        let result = Claude::new(home.path()).write_live(&snapshot("t2", "bob"));
+
+        assert!(result.is_err());
+        assert_eq!(read_json(&credentials).unwrap(), Some(original));
     }
 
     #[test]

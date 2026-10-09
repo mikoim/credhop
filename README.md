@@ -55,6 +55,8 @@ that is not saved, `use` stops; save it first or pass `--force` to discard it.
 - Quit Claude Code and Codex before switching. Running sessions keep the old
   credentials, and Claude Code may overwrite `~/.claude.json` while it runs.
 - `CLAUDE_CONFIG_DIR` and `CODEX_HOME` are not supported.
+- credhop replaces files atomically, so a symlinked `~/.claude.json`,
+  `~/.claude/.credentials.json` or `~/.codex/auth.json` becomes a regular file.
 
 ## License
 

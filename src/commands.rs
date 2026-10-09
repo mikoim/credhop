@@ -82,6 +82,9 @@ pub fn save(ctx: &Ctx, tool: Tool, name: &str, force: bool, out: &mut dyn Write)
     let live = provider
         .read_live()?
         .with_context(|| format!("not logged in to {tool}"))?;
+    if provider.account_id(&live).is_none() {
+        bail!("cannot identify the current {tool} account; log in again and retry");
+    }
     // One account per profile, so `use` knows where to write rotated tokens back.
     if let Some(owner) = ctx.find_owner(tool, provider.as_ref(), &live)?
         && owner != name
@@ -243,6 +246,20 @@ mod tests {
         let (_home, ctx) = setup();
         let err = save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap_err();
         assert!(err.to_string().contains("not logged in to claude"));
+    }
+
+    #[test]
+    fn save_rejects_login_without_account_id() {
+        let (_home, ctx) = setup();
+        login_claude(&ctx, "alice", "a1");
+        fs::write(ctx.home.join(".claude.json"), "{}").unwrap();
+
+        let err = save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "cannot identify the current claude account; log in again and retry"
+        );
     }
 
     #[test]

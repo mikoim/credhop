@@ -57,7 +57,10 @@ impl Provider for Codex {
 }
 
 fn api_key(snapshot: &Value) -> Option<&str> {
-    snapshot.get("OPENAI_API_KEY").and_then(Value::as_str)
+    snapshot
+        .get("OPENAI_API_KEY")
+        .and_then(Value::as_str)
+        .filter(|key| !key.is_empty())
 }
 
 fn last4(s: &str) -> String {
@@ -145,5 +148,13 @@ mod tests {
 
         assert_eq!(codex.account_id(&auth).as_deref(), Some("apikey:abcd"));
         assert_eq!(codex.display(&auth).as_deref(), Some("API key (****abcd)"));
+    }
+
+    #[test]
+    fn empty_api_key_gives_no_account_id() {
+        let home = tempdir().unwrap();
+        let codex = Codex::new(home.path());
+
+        assert_eq!(codex.account_id(&json!({"OPENAI_API_KEY": ""})), None);
     }
 }
