@@ -3,14 +3,17 @@
 mod claude;
 mod codex;
 mod commands;
+mod completion;
 mod fsutil;
 mod provider;
 mod store;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{ArgValueCandidates, CompleteEnv};
 
 use crate::commands::Ctx;
+use crate::completion::Shell;
 use crate::provider::Tool;
 use crate::store::{Store, data_root};
 
@@ -41,6 +44,7 @@ enum Command {
     Use {
         #[arg(value_enum)]
         tool: Tool,
+        #[arg(add = ArgValueCandidates::new(completion::profile_names))]
         name: String,
         /// Discard current credentials that are not saved in any profile
         #[arg(long)]
@@ -50,13 +54,22 @@ enum Command {
     Remove {
         #[arg(value_enum)]
         tool: Tool,
+        #[arg(add = ArgValueCandidates::new(completion::profile_names))]
         name: String,
     },
     /// Show the current account of each tool
     Status,
+    /// Print the shell completion script
+    Completions {
+        #[arg(value_enum)]
+        shell: Shell,
+    },
 }
 
 fn main() -> Result<()> {
+    CompleteEnv::with_factory(Cli::command)
+        .var(completion::COMPLETE_VAR)
+        .complete();
     let cli = Cli::parse();
     let home = std::env::home_dir().context("cannot determine the home directory")?;
     let store = Store::new(data_root(std::env::var_os("XDG_DATA_HOME"), &home));
@@ -71,6 +84,7 @@ fn main() -> Result<()> {
         }
         Command::Remove { tool, name } => commands::remove(&ctx, tool, &name, &mut out),
         Command::Status => commands::status(&ctx, &mut out),
+        Command::Completions { shell } => completion::write_registration(shell, &mut out),
     }
 }
 
@@ -92,5 +106,15 @@ mod tests {
             Command::Use { tool: Tool::Codex, ref name, force: true } if name == "personal"
         ));
         assert!(Cli::try_parse_from(["credhop", "use", "gemini", "x"]).is_err());
+    }
+
+    #[test]
+    fn parses_completions_command() {
+        let cli = Cli::try_parse_from(["credhop", "completions", "fish"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Completions { shell: Shell::Fish }
+        ));
+        assert!(Cli::try_parse_from(["credhop", "completions", "zsh"]).is_err());
     }
 }

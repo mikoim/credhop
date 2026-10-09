@@ -37,6 +37,18 @@ credhop remove codex personal
 
 Profile names may contain letters, digits, `_` and `-`.
 
+## Shell completion
+
+Commands, tools and saved profile names are completed in bash and fish.
+
+```sh
+# bash: add to ~/.bashrc
+source <(credhop completions bash)
+
+# fish
+credhop completions fish > ~/.config/fish/completions/credhop.fish
+```
+
 ## How it works
 
 | Tool | Live credentials |
