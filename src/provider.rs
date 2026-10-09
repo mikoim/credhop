@@ -1,10 +1,14 @@
 //! The provider abstraction: one implementation per supported tool.
 
 use std::fmt;
+use std::path::Path;
 
 use anyhow::Result;
 use clap::ValueEnum;
 use serde_json::Value;
+
+use crate::claude::Claude;
+use crate::codex::Codex;
 
 /// A tool whose credentials credhop manages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -44,4 +48,12 @@ pub trait Provider {
     fn account_id(&self, snapshot: &Value) -> Option<String>;
     /// Human-readable label for `status` and `list` (e.g. an email address).
     fn display(&self, snapshot: &Value) -> Option<String>;
+}
+
+/// Returns the provider for `tool` rooted at the user's home directory.
+pub fn provider_for(tool: Tool, home: &Path) -> Box<dyn Provider> {
+    match tool {
+        Tool::Claude => Box::new(Claude::new(home)),
+        Tool::Codex => Box::new(Codex::new(home)),
+    }
 }
