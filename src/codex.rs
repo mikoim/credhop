@@ -72,7 +72,6 @@ fn id_token_claim(snapshot: &Value, claim: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
     use serde_json::json;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
