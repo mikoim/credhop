@@ -200,6 +200,20 @@ mod tests {
     }
 
     #[test]
+    fn list_profiles_skips_foreign_files() {
+        let dir = tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf());
+        store
+            .save_profile(Tool::Claude, "work", &json!({}))
+            .unwrap();
+        let profiles = dir.path().join("profiles/claude");
+        fs::write(profiles.join("notes.txt"), "").unwrap();
+        fs::write(profiles.join("bad name.json"), "{}").unwrap();
+
+        assert_eq!(store.list_profiles(Tool::Claude).unwrap(), ["work"]);
+    }
+
+    #[test]
     fn profile_operations_reject_invalid_names() {
         let dir = tempdir().unwrap();
         let store = Store::new(dir.path().to_path_buf());

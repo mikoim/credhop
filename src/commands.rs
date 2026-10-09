@@ -334,6 +334,32 @@ mod tests {
     }
 
     #[test]
+    fn use_switches_when_not_logged_in() {
+        let (_home, ctx) = setup();
+        login_claude(&ctx, "alice", "a1");
+        save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+        fs::remove_file(ctx.home.join(".claude/.credentials.json")).unwrap();
+
+        use_profile(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+
+        assert_eq!(live_token(&ctx), "a1");
+    }
+
+    #[test]
+    fn use_treats_unidentifiable_login_as_unsaved() {
+        let (_home, ctx) = setup();
+        login_claude(&ctx, "alice", "a1");
+        save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+        login_claude(&ctx, "alice", "a2");
+        fs::write(ctx.home.join(".claude.json"), "{}").unwrap();
+
+        let err = use_profile(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap_err();
+
+        assert!(err.to_string().contains("not saved in any profile"));
+        assert_eq!(live_token(&ctx), "a2");
+    }
+
+    #[test]
     fn use_unknown_profile_fails() {
         let (_home, ctx) = setup();
         let err = use_profile(&ctx, Tool::Claude, "nope", false, &mut Vec::new()).unwrap_err();
@@ -356,6 +382,22 @@ mod tests {
         );
         assert_eq!(ctx.store.active(Tool::Claude).unwrap(), None);
         assert!(remove(&ctx, Tool::Claude, "work", &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn remove_inactive_profile_keeps_active() {
+        let (_home, ctx) = setup();
+        login_claude(&ctx, "alice", "a1");
+        save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+        login_claude(&ctx, "bob", "b1");
+        save(&ctx, Tool::Claude, "personal", false, &mut Vec::new()).unwrap();
+
+        remove(&ctx, Tool::Claude, "work", &mut Vec::new()).unwrap();
+
+        assert_eq!(
+            ctx.store.active(Tool::Claude).unwrap().as_deref(),
+            Some("personal")
+        );
     }
 
     #[test]
