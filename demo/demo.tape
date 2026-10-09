@@ -1,6 +1,7 @@
 # Records demo/demo.gif. Run from the repository root:
 #
 #   vhs demo/demo.tape
+#   gifsicle -b -O3 --colors 16 --lossy=40 demo/demo.gif
 #
 # The recording uses a throwaway HOME, so real credentials are never touched.
 # Logins are simulated with dummy credentials by demo/fake-login.sh.
@@ -35,6 +36,10 @@ Type `export HOME="$DEMO_HOME"` Enter
 Show
 Type "clear" Enter
 
+Type "# Enable shell completion (add this to ~/.bashrc)" Sleep 300ms Enter
+Type "source <(credhop completions bash)" Sleep 500ms Enter
+Sleep 1s
+
 Type "# Log in to Claude Code as usual, then save it as a profile" Sleep 300ms Enter
 Hide
 Type `"$DEMO/fake-login.sh" claude alice` Enter
@@ -59,7 +64,12 @@ Type "clear" Enter
 
 Type "credhop list" Sleep 500ms Enter
 Sleep 2s
-Type "credhop use claude work" Sleep 500ms Enter
+Type "# Tab completes commands, tools and profile names" Sleep 300ms Enter
+Type "credhop u" Sleep 300ms Tab Sleep 500ms
+Type "cl" Sleep 300ms Tab Sleep 500ms
+Tab@300ms 2
+Sleep 1.5s
+Type "w" Sleep 300ms Tab Sleep 500ms Enter
 Sleep 2s
 Type "credhop status" Sleep 500ms Enter
 Sleep 3s
