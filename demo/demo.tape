@@ -1,0 +1,68 @@
+# Records demo/demo.gif. Run from the repository root:
+#
+#   vhs demo/demo.tape
+#
+# The recording uses a throwaway HOME, so real credentials are never touched.
+# Logins are simulated with dummy credentials by demo/fake-login.sh.
+
+Output demo/demo.gif
+
+Require cargo
+
+Set Shell bash
+Set FontSize 18
+Set Width 1100
+Set Height 480
+Set Padding 20
+Set TypingSpeed 40ms
+Set Theme "Catppuccin Mocha"
+
+Hide
+Type `export PS1='\[\e[1;35m\]$\[\e[0m\] '` Enter
+Type `export CARGO_TARGET_DIR="$PWD/target" DEMO="$PWD/demo"` Enter
+Type `cargo build --release --locked --quiet` Enter
+Wait@5m /\$$/
+Type `export DEMO_HOME="$(mktemp -d)" && export CARGO_INSTALL_ROOT="$DEMO_HOME/.local" PATH="$DEMO_HOME/.local/bin:$PATH"` Enter
+Type "clear" Enter
+Show
+
+Type "# Install" Sleep 300ms Enter
+Type "cargo install --path ." Sleep 500ms Enter
+Wait+Screen@5m /Installed package/
+Sleep 1.5s
+Hide
+Type `export HOME="$DEMO_HOME"` Enter
+Show
+Type "clear" Enter
+
+Type "# Log in to Claude Code as usual, then save it as a profile" Sleep 300ms Enter
+Hide
+Type `"$DEMO/fake-login.sh" claude alice` Enter
+Show
+Type "credhop save claude work" Sleep 500ms Enter
+Sleep 1s
+
+Type "# Log in with another account and save it too" Sleep 300ms Enter
+Hide
+Type `"$DEMO/fake-login.sh" claude bob` Enter
+Show
+Type "credhop save claude personal" Sleep 500ms Enter
+Sleep 1s
+
+Type "# Same for Codex" Sleep 300ms Enter
+Hide
+Type `"$DEMO/fake-login.sh" codex alice` Enter
+Show
+Type "credhop save codex work" Sleep 500ms Enter
+Sleep 1.5s
+Type "clear" Enter
+
+Type "credhop list" Sleep 500ms Enter
+Sleep 2s
+Type "credhop use claude work" Sleep 500ms Enter
+Sleep 2s
+Type "credhop status" Sleep 500ms Enter
+Sleep 3s
+
+Hide
+Type `rm -rf "$DEMO_HOME"` Enter

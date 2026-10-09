@@ -5,6 +5,8 @@ Switch the login credentials of [Claude Code](https://claude.com/claude-code) an
 
 Linux only for now.
 
+![credhop demo](demo/demo.gif)
+
 ## Install
 
 ```sh
