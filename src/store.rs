@@ -26,7 +26,9 @@ pub fn data_root(xdg_data_home: Option<OsString>, home: &Path) -> PathBuf {
 /// Profile names become file names, so only allow a safe character set.
 pub fn validate_name(name: &str) -> Result<()> {
     let valid = !name.is_empty()
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
     if !valid {
         bail!("invalid profile name '{name}': use only letters, digits, '_' and '-'");
     }
@@ -96,7 +98,11 @@ impl Store {
             None => state.remove(tool.as_str()),
         };
         create_private_dir(&self.root)?;
-        write_json(&self.state_path(), &serde_json::to_value(&state)?, FILE_MODE)
+        write_json(
+            &self.state_path(),
+            &serde_json::to_value(&state)?,
+            FILE_MODE,
+        )
     }
 
     fn tool_dir(&self, tool: Tool) -> PathBuf {
@@ -134,10 +140,22 @@ mod tests {
     #[test]
     fn data_root_prefers_absolute_xdg_data_home() {
         let home = Path::new("/home/u");
-        assert_eq!(data_root(Some("/xdg".into()), home), PathBuf::from("/xdg/credhop"));
-        assert_eq!(data_root(None, home), PathBuf::from("/home/u/.local/share/credhop"));
-        assert_eq!(data_root(Some("".into()), home), PathBuf::from("/home/u/.local/share/credhop"));
-        assert_eq!(data_root(Some("rel".into()), home), PathBuf::from("/home/u/.local/share/credhop"));
+        assert_eq!(
+            data_root(Some("/xdg".into()), home),
+            PathBuf::from("/xdg/credhop")
+        );
+        assert_eq!(
+            data_root(None, home),
+            PathBuf::from("/home/u/.local/share/credhop")
+        );
+        assert_eq!(
+            data_root(Some("".into()), home),
+            PathBuf::from("/home/u/.local/share/credhop")
+        );
+        assert_eq!(
+            data_root(Some("rel".into()), home),
+            PathBuf::from("/home/u/.local/share/credhop")
+        );
     }
 
     #[test]
@@ -158,11 +176,19 @@ mod tests {
         let snapshot = json!({"token": "t"});
 
         store.save_profile(Tool::Claude, "work", &snapshot).unwrap();
-        store.save_profile(Tool::Claude, "a-first", &snapshot).unwrap();
+        store
+            .save_profile(Tool::Claude, "a-first", &snapshot)
+            .unwrap();
 
-        assert_eq!(store.load_profile(Tool::Claude, "work").unwrap(), Some(snapshot));
+        assert_eq!(
+            store.load_profile(Tool::Claude, "work").unwrap(),
+            Some(snapshot)
+        );
         assert_eq!(store.load_profile(Tool::Claude, "none").unwrap(), None);
-        assert_eq!(store.list_profiles(Tool::Claude).unwrap(), ["a-first", "work"]);
+        assert_eq!(
+            store.list_profiles(Tool::Claude).unwrap(),
+            ["a-first", "work"]
+        );
         assert!(store.list_profiles(Tool::Codex).unwrap().is_empty());
         assert_eq!(mode(&root), 0o700);
         assert_eq!(mode(&root.join("profiles/claude")), 0o700);
@@ -189,7 +215,10 @@ mod tests {
         assert_eq!(store.active(Tool::Codex).unwrap(), None);
         store.set_active(Tool::Codex, Some("personal")).unwrap();
         store.set_active(Tool::Claude, Some("work")).unwrap();
-        assert_eq!(store.active(Tool::Codex).unwrap().as_deref(), Some("personal"));
+        assert_eq!(
+            store.active(Tool::Codex).unwrap().as_deref(),
+            Some("personal")
+        );
 
         store.set_active(Tool::Codex, None).unwrap();
         assert_eq!(store.active(Tool::Codex).unwrap(), None);

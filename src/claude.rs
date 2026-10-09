@@ -38,7 +38,9 @@ impl Provider for Claude {
         let oauth_account = read_json(&self.config_path)?
             .and_then(|config| config.get("oauthAccount").cloned())
             .unwrap_or(Value::Null);
-        Ok(Some(json!({"credentials": credentials, "oauthAccount": oauth_account})))
+        Ok(Some(
+            json!({"credentials": credentials, "oauthAccount": oauth_account}),
+        ))
     }
 
     fn write_live(&self, snapshot: &Value) -> Result<()> {
@@ -70,10 +72,12 @@ impl Provider for Claude {
     fn account_id(&self, snapshot: &Value) -> Option<String> {
         let account = snapshot.get("oauthAccount")?;
         let user = account.get("accountUuid")?.as_str()?;
-        Some(match account.get("organizationUuid").and_then(Value::as_str) {
-            Some(org) => format!("{user}:{org}"),
-            None => user.to_owned(),
-        })
+        Some(
+            match account.get("organizationUuid").and_then(Value::as_str) {
+                Some(org) => format!("{user}:{org}"),
+                None => user.to_owned(),
+            },
+        )
     }
 
     fn display(&self, snapshot: &Value) -> Option<String> {
@@ -117,20 +121,31 @@ mod tests {
     fn read_live_combines_credentials_and_oauth_account() {
         let home = tempdir().unwrap();
         let expected = snapshot("t1", "alice");
-        write(&home.path().join(".claude/.credentials.json"), &expected["credentials"], 0o600);
+        write(
+            &home.path().join(".claude/.credentials.json"),
+            &expected["credentials"],
+            0o600,
+        );
         write(
             &home.path().join(".claude.json"),
             &json!({"numStartups": 3, "oauthAccount": expected["oauthAccount"]}),
             0o644,
         );
 
-        assert_eq!(Claude::new(home.path()).read_live().unwrap(), Some(expected));
+        assert_eq!(
+            Claude::new(home.path()).read_live().unwrap(),
+            Some(expected)
+        );
     }
 
     #[test]
     fn read_live_uses_null_when_oauth_account_is_missing() {
         let home = tempdir().unwrap();
-        write(&home.path().join(".claude/.credentials.json"), &json!({}), 0o600);
+        write(
+            &home.path().join(".claude/.credentials.json"),
+            &json!({}),
+            0o600,
+        );
 
         let live = Claude::new(home.path()).read_live().unwrap().unwrap();
         assert!(live["oauthAccount"].is_null());
@@ -150,10 +165,18 @@ mod tests {
         Claude::new(home.path()).write_live(&target).unwrap();
 
         let credentials = home.path().join(".claude/.credentials.json");
-        assert_eq!(read_json(&credentials).unwrap(), Some(target["credentials"].clone()));
+        assert_eq!(
+            read_json(&credentials).unwrap(),
+            Some(target["credentials"].clone())
+        );
         assert_eq!(mode(&credentials), 0o600);
         let written = read_json(&config).unwrap().unwrap();
-        let keys: Vec<&str> = written.as_object().unwrap().keys().map(String::as_str).collect();
+        let keys: Vec<&str> = written
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         assert_eq!(keys, ["zeta", "oauthAccount", "alpha"]);
         assert_eq!(written["oauthAccount"], target["oauthAccount"]);
         assert_eq!(mode(&config), 0o644);

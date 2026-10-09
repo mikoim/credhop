@@ -21,7 +21,12 @@ impl Ctx {
     }
 
     /// Name of the saved profile holding the same account as `snapshot`.
-    fn find_owner(&self, tool: Tool, provider: &dyn Provider, snapshot: &Value) -> Result<Option<String>> {
+    fn find_owner(
+        &self,
+        tool: Tool,
+        provider: &dyn Provider,
+        snapshot: &Value,
+    ) -> Result<Option<String>> {
         let Some(id) = provider.account_id(snapshot) else {
             return Ok(None);
         };
@@ -54,7 +59,11 @@ pub fn list(ctx: &Ctx, out: &mut dyn Write) -> Result<()> {
             writeln!(out, "  (no profiles)")?;
         }
         for name in names {
-            let marker = if active.as_deref() == Some(name.as_str()) { '*' } else { ' ' };
+            let marker = if active.as_deref() == Some(name.as_str()) {
+                '*'
+            } else {
+                ' '
+            };
             let display = ctx
                 .store
                 .load_profile(tool, &name)?
@@ -84,11 +93,21 @@ pub fn save(ctx: &Ctx, tool: Tool, name: &str, force: bool, out: &mut dyn Write)
     }
     ctx.store.save_profile(tool, name, &live)?;
     ctx.store.set_active(tool, Some(name))?;
-    writeln!(out, "Saved {tool} profile '{name}'{}", label(provider.as_ref(), &live))?;
+    writeln!(
+        out,
+        "Saved {tool} profile '{name}'{}",
+        label(provider.as_ref(), &live)
+    )?;
     Ok(())
 }
 
-pub fn use_profile(ctx: &Ctx, tool: Tool, name: &str, force: bool, out: &mut dyn Write) -> Result<()> {
+pub fn use_profile(
+    ctx: &Ctx,
+    tool: Tool,
+    name: &str,
+    force: bool,
+    out: &mut dyn Write,
+) -> Result<()> {
     if ctx.store.load_profile(tool, name)?.is_none() {
         bail!("profile '{tool}/{name}' not found");
     }
@@ -169,7 +188,11 @@ mod tests {
     fn login_claude(ctx: &Ctx, user: &str, token: &str) {
         fs::create_dir_all(ctx.home.join(".claude")).unwrap();
         let credentials = json!({"claudeAiOauth": {"accessToken": token}});
-        fs::write(ctx.home.join(".claude/.credentials.json"), credentials.to_string()).unwrap();
+        fs::write(
+            ctx.home.join(".claude/.credentials.json"),
+            credentials.to_string(),
+        )
+        .unwrap();
         let config = json!({
             "numStartups": 1,
             "oauthAccount": {"accountUuid": user, "emailAddress": format!("{user}@example.com")},
@@ -180,12 +203,18 @@ mod tests {
     fn live_token(ctx: &Ctx) -> String {
         let bytes = fs::read(ctx.home.join(".claude/.credentials.json")).unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
-        value["claudeAiOauth"]["accessToken"].as_str().unwrap().to_owned()
+        value["claudeAiOauth"]["accessToken"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     }
 
     fn profile_token(ctx: &Ctx, name: &str) -> String {
         let profile = ctx.store.load_profile(Tool::Claude, name).unwrap().unwrap();
-        profile["credentials"]["claudeAiOauth"]["accessToken"].as_str().unwrap().to_owned()
+        profile["credentials"]["claudeAiOauth"]["accessToken"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     }
 
     fn output(f: impl FnOnce(&mut Vec<u8>) -> Result<()>) -> String {
@@ -203,7 +232,10 @@ mod tests {
 
         assert_eq!(out, "Saved claude profile 'work' (alice@example.com)\n");
         assert_eq!(profile_token(&ctx, "work"), "a1");
-        assert_eq!(ctx.store.active(Tool::Claude).unwrap().as_deref(), Some("work"));
+        assert_eq!(
+            ctx.store.active(Tool::Claude).unwrap().as_deref(),
+            Some("work")
+        );
     }
 
     #[test]
@@ -251,7 +283,10 @@ mod tests {
         assert!(out.starts_with("Switched claude to 'work' (alice@example.com)"));
         assert_eq!(profile_token(&ctx, "personal"), "b2");
         assert_eq!(live_token(&ctx), "a1");
-        assert_eq!(ctx.store.active(Tool::Claude).unwrap().as_deref(), Some("work"));
+        assert_eq!(
+            ctx.store.active(Tool::Claude).unwrap().as_deref(),
+            Some("work")
+        );
     }
 
     #[test]
@@ -296,7 +331,12 @@ mod tests {
 
         remove(&ctx, Tool::Claude, "work", &mut Vec::new()).unwrap();
 
-        assert!(ctx.store.load_profile(Tool::Claude, "work").unwrap().is_none());
+        assert!(
+            ctx.store
+                .load_profile(Tool::Claude, "work")
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(ctx.store.active(Tool::Claude).unwrap(), None);
         assert!(remove(&ctx, Tool::Claude, "work", &mut Vec::new()).is_err());
     }
@@ -319,6 +359,8 @@ mod tests {
         );
 
         login_claude(&ctx, "carol", "c1");
-        assert!(output(|out| status(&ctx, out)).starts_with("claude  (unsaved) (carol@example.com)\n"));
+        assert!(
+            output(|out| status(&ctx, out)).starts_with("claude  (unsaved) (carol@example.com)\n")
+        );
     }
 }

@@ -95,7 +95,11 @@ mod tests {
     #[test]
     fn read_json_returns_none_for_missing_file() {
         let dir = tempdir().unwrap();
-        assert!(read_json(&dir.path().join("missing.json")).unwrap().is_none());
+        assert!(
+            read_json(&dir.path().join("missing.json"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -103,7 +107,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("bad.json");
         fs::write(&path, "{").unwrap();
-        assert!(read_json(&path).unwrap_err().to_string().contains("invalid JSON"));
+        assert!(
+            read_json(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid JSON")
+        );
     }
 
     #[test]

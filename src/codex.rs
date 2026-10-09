@@ -15,7 +15,9 @@ pub struct Codex {
 
 impl Codex {
     pub fn new(home: &Path) -> Self {
-        Self { dir: home.join(".codex") }
+        Self {
+            dir: home.join(".codex"),
+        }
     }
 
     fn auth_path(&self) -> PathBuf {
@@ -35,7 +37,10 @@ impl Provider for Codex {
 
     fn account_id(&self, snapshot: &Value) -> Option<String> {
         // `account_id` identifies the ChatGPT workspace; `sub` identifies the user in it.
-        if let Some(workspace) = snapshot.pointer("/tokens/account_id").and_then(Value::as_str) {
+        if let Some(workspace) = snapshot
+            .pointer("/tokens/account_id")
+            .and_then(Value::as_str)
+        {
             let user = id_token_claim(snapshot, "sub");
             return Some(match user {
                 Some(user) => format!("{workspace}:{user}"),
@@ -103,7 +108,10 @@ mod tests {
         codex.write_live(&chatgpt_auth()).unwrap();
 
         let path = home.path().join(".codex/auth.json");
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert_eq!(codex.read_live().unwrap(), Some(chatgpt_auth()));
     }
 
@@ -122,7 +130,10 @@ mod tests {
         let home = tempdir().unwrap();
         let auth = json!({"tokens": {"id_token": "garbage", "account_id": "ws-1"}});
 
-        assert_eq!(Codex::new(home.path()).account_id(&auth).as_deref(), Some("ws-1"));
+        assert_eq!(
+            Codex::new(home.path()).account_id(&auth).as_deref(),
+            Some("ws-1")
+        );
         assert_eq!(Codex::new(home.path()).display(&auth), None);
     }
 
