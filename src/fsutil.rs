@@ -49,6 +49,15 @@ pub fn read_json(path: &Path) -> Result<Option<Value>> {
     Ok(Some(value))
 }
 
+/// Delete the file at `path`. A missing file is not an error.
+pub fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
 /// Atomically write `value` as pretty-printed JSON.
 pub fn write_json(path: &Path, value: &Value, mode: u32) -> Result<()> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
@@ -113,6 +122,18 @@ mod tests {
                 .to_string()
                 .contains("invalid JSON")
         );
+    }
+
+    #[test]
+    fn remove_file_if_exists_ignores_missing_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.json");
+        fs::write(&path, "{}").unwrap();
+
+        remove_file_if_exists(&path).unwrap();
+        remove_file_if_exists(&path).unwrap();
+
+        assert!(!path.exists());
     }
 
     #[test]

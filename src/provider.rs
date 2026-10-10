@@ -44,6 +44,8 @@ pub trait Provider {
     fn read_live(&self) -> Result<Option<Value>>;
     /// Replace the live credentials with the snapshot.
     fn write_live(&self, snapshot: &Value) -> Result<()>;
+    /// Delete the live credentials so the tool asks to log in again.
+    fn clear_live(&self) -> Result<()>;
     /// Stable account identifier used to match live credentials to a profile.
     fn account_id(&self, snapshot: &Value) -> Option<String>;
     /// Human-readable label for `status` and `list` (e.g. an email address).

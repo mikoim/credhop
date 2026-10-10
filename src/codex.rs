@@ -6,7 +6,7 @@ use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::Value;
 
-use crate::fsutil::{create_private_dir, read_json, write_json};
+use crate::fsutil::{create_private_dir, read_json, remove_file_if_exists, write_json};
 use crate::provider::Provider;
 
 pub struct Codex {
@@ -33,6 +33,10 @@ impl Provider for Codex {
     fn write_live(&self, snapshot: &Value) -> Result<()> {
         create_private_dir(&self.dir)?;
         write_json(&self.auth_path(), snapshot, 0o600)
+    }
+
+    fn clear_live(&self) -> Result<()> {
+        remove_file_if_exists(&self.auth_path())
     }
 
     fn account_id(&self, snapshot: &Value) -> Option<String> {
@@ -116,6 +120,18 @@ mod tests {
             0o600
         );
         assert_eq!(codex.read_live().unwrap(), Some(chatgpt_auth()));
+    }
+
+    #[test]
+    fn clear_live_removes_auth_file() {
+        let home = tempdir().unwrap();
+        let codex = Codex::new(home.path());
+        codex.write_live(&chatgpt_auth()).unwrap();
+
+        codex.clear_live().unwrap();
+        codex.clear_live().unwrap();
+
+        assert!(codex.read_live().unwrap().is_none());
     }
 
     #[test]

@@ -50,6 +50,14 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Delete the current credentials (after saving them) to log in to another account
+    Logout {
+        #[arg(value_enum)]
+        tool: Tool,
+        /// Discard current credentials that are not saved in any profile
+        #[arg(long)]
+        force: bool,
+    },
     /// Delete a saved profile
     Remove {
         #[arg(value_enum)]
@@ -82,6 +90,7 @@ fn main() -> Result<()> {
         Command::Use { tool, name, force } => {
             commands::use_profile(&ctx, tool, &name, force, &mut out)
         }
+        Command::Logout { tool, force } => commands::logout(&ctx, tool, force, &mut out),
         Command::Remove { tool, name } => commands::remove(&ctx, tool, &name, &mut out),
         Command::Status => commands::status(&ctx, &mut out),
         Command::Completions { shell } => completion::write_registration(shell, &mut out),

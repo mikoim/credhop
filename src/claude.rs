@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use crate::fsutil::{create_private_dir, read_json, write_json};
+use crate::fsutil::{create_private_dir, read_json, remove_file_if_exists, write_json};
 use crate::provider::Provider;
 
 /// Claude Code stores OAuth tokens in `~/.claude/.credentials.json` and the
@@ -73,6 +73,20 @@ impl Provider for Claude {
         create_private_dir(&self.dir)?;
         write_json(&self.credentials_path(), credentials, 0o600)?;
         if let Some((config, mode)) = config {
+            write_json(&self.config_path, &config, mode)?;
+        }
+        Ok(())
+    }
+
+    fn clear_live(&self) -> Result<()> {
+        // Credentials first: without them the tool is simply logged out, whereas
+        // credentials without oauthAccount could not be matched to a profile.
+        remove_file_if_exists(&self.credentials_path())?;
+        if let Some(mut config) = read_json(&self.config_path)?
+            && let Some(object) = config.as_object_mut()
+            && object.shift_remove("oauthAccount").is_some()
+        {
+            let mode = fs::metadata(&self.config_path)?.permissions().mode() & 0o777;
             write_json(&self.config_path, &config, mode)?;
         }
         Ok(())
@@ -226,6 +240,39 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(read_json(&credentials).unwrap(), Some(original));
+    }
+
+    #[test]
+    fn clear_live_removes_credentials_and_oauth_account_only() {
+        let home = tempdir().unwrap();
+        let credentials = home.path().join(".claude/.credentials.json");
+        let config = home.path().join(".claude.json");
+        write(&credentials, &json!({}), 0o600);
+        write(
+            &config,
+            &json!({"zeta": 1, "oauthAccount": {"accountUuid": "alice"}, "alpha": 2}),
+            0o644,
+        );
+        let claude = Claude::new(home.path());
+
+        claude.clear_live().unwrap();
+
+        assert!(!credentials.exists());
+        assert_eq!(
+            read_json(&config).unwrap(),
+            Some(json!({"zeta": 1, "alpha": 2}))
+        );
+        assert_eq!(mode(&config), 0o644);
+        assert!(claude.read_live().unwrap().is_none());
+    }
+
+    #[test]
+    fn clear_live_succeeds_when_nothing_exists() {
+        let home = tempdir().unwrap();
+
+        Claude::new(home.path()).clear_live().unwrap();
+
+        assert!(!home.path().join(".claude.json").exists());
     }
 
     #[test]

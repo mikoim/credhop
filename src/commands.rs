@@ -39,6 +39,35 @@ impl Ctx {
         }
         Ok(None)
     }
+
+    /// Writes the live credentials back to the profile of the same account
+    /// before they are replaced, since tokens rotate while a tool runs.
+    /// Returns that profile's name, or None if nothing was saved.
+    fn write_back_live(
+        &self,
+        tool: Tool,
+        provider: &dyn Provider,
+        force: bool,
+        out: &mut dyn Write,
+    ) -> Result<Option<String>> {
+        let Some(live) = provider.read_live()? else {
+            return Ok(None);
+        };
+        match self.find_owner(tool, provider, &live)? {
+            Some(owner) => {
+                self.store.save_profile(tool, &owner, &live)?;
+                Ok(Some(owner))
+            }
+            None if force => {
+                writeln!(out, "Discarding unsaved {tool} credentials (--force)")?;
+                Ok(None)
+            }
+            None => bail!(
+                "current {tool} credentials are not saved in any profile; \
+                 run `credhop save {tool} <name>` first or pass --force"
+            ),
+        }
+    }
 }
 
 /// `" (alice@example.com)"`, or an empty string when there is no label.
@@ -116,17 +145,7 @@ pub fn use_profile(
     }
     let provider = ctx.provider(tool);
 
-    // Tokens rotate while a tool runs: save the live ones before replacing them.
-    if let Some(live) = provider.read_live()? {
-        match ctx.find_owner(tool, provider.as_ref(), &live)? {
-            Some(owner) => ctx.store.save_profile(tool, &owner, &live)?,
-            None if force => writeln!(out, "Discarding unsaved {tool} credentials (--force)")?,
-            None => bail!(
-                "current {tool} credentials are not saved in any profile; \
-                 run `credhop save {tool} <name>` first or pass --force"
-            ),
-        }
-    }
+    ctx.write_back_live(tool, provider.as_ref(), force, out)?;
 
     // Load after the write-back, which may have updated this very profile.
     let target = ctx
@@ -139,6 +158,33 @@ pub fn use_profile(
         out,
         "Switched {tool} to '{name}'{}. Restart running {tool} sessions to apply.",
         label(provider.as_ref(), &target)
+    )?;
+    Ok(())
+}
+
+/// Logs out locally so the next login can add a new account without losing
+/// the rotated tokens of the current one.
+pub fn logout(ctx: &Ctx, tool: Tool, force: bool, out: &mut dyn Write) -> Result<()> {
+    let provider = ctx.provider(tool);
+    if provider.read_live()?.is_none() {
+        writeln!(out, "Not logged in to {tool}")?;
+        return Ok(());
+    }
+    let owner = ctx.write_back_live(tool, provider.as_ref(), force, out)?;
+    provider.clear_live()?;
+    ctx.store.set_active(tool, None)?;
+    match owner {
+        Some(owner) => writeln!(out, "Logged out of {tool}; credentials saved to '{owner}'")?,
+        None => writeln!(out, "Logged out of {tool}")?,
+    }
+    // Claude Code skips the login screen once onboarding is done, so say how to log in.
+    let login = match tool {
+        Tool::Claude => "Start claude and run /login",
+        Tool::Codex => "Run `codex login`",
+    };
+    writeln!(
+        out,
+        "{login}, then run `credhop save {tool} <name>` to add a profile."
     )?;
     Ok(())
 }
@@ -364,6 +410,50 @@ mod tests {
         let (_home, ctx) = setup();
         let err = use_profile(&ctx, Tool::Claude, "nope", false, &mut Vec::new()).unwrap_err();
         assert!(err.to_string().contains("profile 'claude/nope' not found"));
+    }
+
+    #[test]
+    fn logout_writes_back_rotated_tokens_and_clears_live() {
+        let (_home, ctx) = setup();
+        login_claude(&ctx, "alice", "a1");
+        save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+        login_claude(&ctx, "alice", "a2"); // Claude Code refreshed the token.
+
+        let out = output(|out| logout(&ctx, Tool::Claude, false, out));
+
+        assert_eq!(
+            out,
+            "Logged out of claude; credentials saved to 'work'\n\
+             Start claude and run /login, then run `credhop save claude <name>` to add a profile.\n"
+        );
+        assert_eq!(profile_token(&ctx, "work"), "a2");
+        assert!(!ctx.home.join(".claude/.credentials.json").exists());
+        assert_eq!(ctx.store.active(Tool::Claude).unwrap(), None);
+    }
+
+    #[test]
+    fn logout_refuses_to_discard_unsaved_account_without_force() {
+        let (_home, ctx) = setup();
+        login_claude(&ctx, "carol", "c1");
+
+        let err = logout(&ctx, Tool::Claude, false, &mut Vec::new()).unwrap_err();
+        assert!(err.to_string().contains("not saved in any profile"));
+        assert_eq!(live_token(&ctx), "c1");
+
+        let out = output(|out| logout(&ctx, Tool::Claude, true, out));
+        assert!(out.starts_with(
+            "Discarding unsaved claude credentials (--force)\nLogged out of claude\n"
+        ));
+        assert!(!ctx.home.join(".claude/.credentials.json").exists());
+    }
+
+    #[test]
+    fn logout_when_not_logged_in_does_nothing() {
+        let (_home, ctx) = setup();
+
+        let out = output(|out| logout(&ctx, Tool::Claude, false, out));
+
+        assert_eq!(out, "Not logged in to claude\n");
     }
 
     #[test]

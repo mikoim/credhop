@@ -37,6 +37,18 @@ credhop remove codex personal
 
 Profile names may contain letters, digits, `_` and `-`.
 
+To add another account, log out with credhop first. It writes the current
+tokens back to their profile, then deletes the live credentials so you can
+log in to another account:
+
+```sh
+credhop logout claude        # current tokens are saved to "work"
+claude                       # run /login as another account
+credhop save claude team
+```
+
+`credhop logout` only deletes local files; it does not revoke the tokens.
+
 ## Shell completion
 
 Commands, tools and saved profile names are completed in bash and fish.
