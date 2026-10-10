@@ -47,23 +47,27 @@ Show
 Type "credhop save claude work" Sleep 500ms Enter
 Sleep 1s
 
-Type "# Log in with another account and save it too" Sleep 300ms Enter
+Type "# To add another account, log out with credhop first" Sleep 300ms Enter
+Type "credhop logout claude" Sleep 500ms Enter
+Sleep 2.5s
+
+Type "# Run /login in Claude Code as another account, then save it" Sleep 300ms Enter
 Hide
 Type `"$DEMO/fake-login.sh" claude bob` Enter
 Show
 Type "credhop save claude personal" Sleep 500ms Enter
-Sleep 1s
+Sleep 1.5s
+Type "clear" Enter
 
-Type "# Same for Codex" Sleep 300ms Enter
+Type "# Codex works the same way" Sleep 300ms Enter
 Hide
 Type `"$DEMO/fake-login.sh" codex alice` Enter
 Show
 Type "credhop save codex work" Sleep 500ms Enter
-Sleep 1.5s
-Type "clear" Enter
-
+Sleep 1s
 Type "credhop list" Sleep 500ms Enter
 Sleep 2s
+
 Type "# Tab completes commands, tools and profile names" Sleep 300ms Enter
 Type "credhop u" Sleep 300ms Tab Sleep 500ms
 Type "cl" Sleep 300ms Tab Sleep 500ms
@@ -72,6 +76,13 @@ Sleep 1.5s
 Type "w" Sleep 300ms Tab Sleep 500ms Enter
 Sleep 2s
 Type "credhop status" Sleep 500ms Enter
+Sleep 2.5s
+Type "clear" Enter
+
+Type "# Remove a profile you no longer need" Sleep 300ms Enter
+Type "credhop remove codex work" Sleep 500ms Enter
+Sleep 1s
+Type "credhop list" Sleep 500ms Enter
 Sleep 3s
 
 Hide
