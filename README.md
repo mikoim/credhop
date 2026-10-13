@@ -62,9 +62,14 @@ credhop completions fish > ~/.config/fish/completions/credhop.fish
 ```
 
 ```powershell
-# PowerShell (Windows PowerShell 5.1 and PowerShell 7): add to $PROFILE
+# PowerShell: add to $PROFILE
 credhop completions powershell | Out-String | Invoke-Expression
 ```
+
+PowerShell completion is supported on the latest PowerShell 7. It also works
+on Windows PowerShell 5.1 and older PowerShell 7 releases, with known minor
+issues: for example, a quoted empty argument such as `''` can shift the
+position being completed.
 
 ## How it works
 
