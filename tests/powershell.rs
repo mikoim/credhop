@@ -21,7 +21,10 @@ if ($env:COMPLETE -ne 'preset') { throw "COMPLETE was not restored: $env:COMPLET
 "#;
 
 /// The installed PowerShell executables: Windows PowerShell 5.1 and PowerShell 7.
+/// A missing one is skipped locally but fails the test in CI (`CI` set), where
+/// all of them are expected.
 fn shells() -> Vec<&'static str> {
+    let ci = std::env::var_os("CI").is_some_and(|value| !value.is_empty());
     let candidates: &[&'static str] = if cfg!(windows) {
         &["powershell", "pwsh"]
     } else {
@@ -35,6 +38,7 @@ fn shells() -> Vec<&'static str> {
                 .args(["-NoProfile", "-NonInteractive", "-Command", "exit 0"])
                 .output()
                 .is_ok_and(|output| output.status.success());
+            assert!(found || !ci, "{shell} is not installed");
             if !found {
                 eprintln!("skipping {shell}: not installed");
             }
