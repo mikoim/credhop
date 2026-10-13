@@ -61,7 +61,10 @@ pub fn remove_file_if_exists(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("failed to remove {}", path.display())),
+        Err(e) => {
+            let hint = failure_hint(path, &e);
+            Err(e).with_context(|| format!("failed to remove {}{hint}", path.display()))
+        }
     }
 }
 
@@ -103,18 +106,24 @@ fn write_and_rename(
     // Close the file before renaming it over `path`.
     drop(file);
     if let Err(e) = fs::rename(tmp, path) {
-        let hint = in_use_hint(&e);
+        let hint = failure_hint(path, &e);
         return Err(e).with_context(|| format!("failed to replace {}{hint}", path.display()));
     }
     Ok(())
 }
 
-/// On Windows a file cannot be replaced while another process has it open.
+/// Explains why Windows refused to replace or remove `path`: the file is
+/// read-only, or another process (a running tool) has it open.
 #[cfg(windows)]
-fn in_use_hint(e: &io::Error) -> &'static str {
+fn failure_hint(path: &Path, e: &io::Error) -> &'static str {
     const ERROR_ACCESS_DENIED: i32 = 5;
     const ERROR_SHARING_VIOLATION: i32 = 32;
     match e.raw_os_error() {
+        Some(ERROR_ACCESS_DENIED)
+            if fs::metadata(path).is_ok_and(|metadata| metadata.permissions().readonly()) =>
+        {
+            " (the file is read-only)"
+        }
         Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION) => {
             " (quit Claude Code and Codex, then try again)"
         }
@@ -123,7 +132,7 @@ fn in_use_hint(e: &io::Error) -> &'static str {
 }
 
 #[cfg(not(windows))]
-fn in_use_hint(_: &io::Error) -> &'static str {
+fn failure_hint(_: &Path, _: &io::Error) -> &'static str {
     ""
 }
 
@@ -365,5 +374,50 @@ mod tests {
         fs::set_permissions(&path, writable).unwrap();
         replace_json(&path, &json!({"a": 1})).unwrap();
         assert_eq!(read_json(&path).unwrap(), Some(json!({"a": 1})));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replacing_a_read_only_file_says_so() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.json");
+        fs::write(&path, "{}").unwrap();
+        let writable = fs::metadata(&path).unwrap().permissions();
+        let mut read_only = writable.clone();
+        read_only.set_readonly(true);
+        fs::set_permissions(&path, read_only).unwrap();
+
+        let err = write_private_json(&path, &json!({})).unwrap_err();
+
+        fs::set_permissions(&path, writable).unwrap();
+        assert!(
+            err.to_string().ends_with(" (the file is read-only)"),
+            "{err:#}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn removing_a_file_in_use_suggests_quitting_the_tools() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.json");
+        fs::write(&path, "{}").unwrap();
+        // Like a running tool that holds the file open without sharing it.
+        let open = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+
+        let err = remove_file_if_exists(&path).unwrap_err();
+
+        drop(open);
+        assert!(
+            err.to_string()
+                .ends_with(" (quit Claude Code and Codex, then try again)"),
+            "{err:#}"
+        );
+        assert!(path.exists());
     }
 }
