@@ -5,7 +5,12 @@ Register-ArgumentCompleter -Native -CommandName credhop, credhop.exe -ScriptBloc
     # The words before the cursor, unquoted. They are passed to credhop as
     # arguments and never evaluated, so a $(...) being typed does not run.
     $words = @(foreach ($element in $commandAst.CommandElements) {
-        if ($element.Extent.EndOffset -gt $cursorPosition) { break }
+        if ($element.Extent.StartOffset -ge $cursorPosition) { break }
+        if ($element.Extent.EndOffset -gt $cursorPosition) {
+            # The cursor is inside this word: complete it as PowerShell sees it.
+            $wordToComplete
+            break
+        }
         if ($element -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
             $element.Value
         } else {

@@ -9,13 +9,13 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use tempfile::tempdir;
 
 /// Loads the registration script and prints the completions of `$env:CREDHOP_INPUT`
-/// with the cursor at its end. Strict mode and a preset `$env:COMPLETE` stand in
+/// with the cursor at `$env:CREDHOP_CURSOR`. Strict mode and a preset `$env:COMPLETE` stand in
 /// for a user's profile; the preset must survive the completion.
 const SCRIPT: &str = r#"
 Set-StrictMode -Version Latest
 credhop completions powershell | Out-String | Invoke-Expression
 $env:COMPLETE = 'preset'
-$completion = TabExpansion2 -inputScript $env:CREDHOP_INPUT -cursorColumn $env:CREDHOP_INPUT.Length
+$completion = TabExpansion2 -inputScript $env:CREDHOP_INPUT -cursorColumn ([int]$env:CREDHOP_CURSOR)
 foreach ($match in $completion.CompletionMatches) { $match.CompletionText }
 if ($env:COMPLETE -ne 'preset') { throw "COMPLETE was not restored: $env:COMPLETE" }
 "#;
@@ -43,8 +43,14 @@ fn shells() -> Vec<&'static str> {
         .collect()
 }
 
-/// Completes `input` in `shell` with credhop isolated in `home` and returns the non-flag candidates.
+/// Completes `input` in `shell` with the cursor at its end; see `complete_at`.
 fn complete(shell: &str, home: &Path, input: &str) -> Vec<String> {
+    complete_at(shell, home, input, input.len())
+}
+
+/// Completes `input` in `shell` with the cursor at column `cursor` and credhop isolated
+/// in `home`, and returns the non-flag candidates.
+fn complete_at(shell: &str, home: &Path, input: &str, cursor: usize) -> Vec<String> {
     let bin_dir = Path::new(env!("CARGO_BIN_EXE_credhop")).parent().unwrap();
     let path = std::env::var_os("PATH").unwrap_or_default();
     let path = std::env::join_paths(
@@ -60,6 +66,7 @@ fn complete(shell: &str, home: &Path, input: &str) -> Vec<String> {
         .arg(STANDARD.encode(script))
         .env("PATH", path)
         .env("CREDHOP_INPUT", input)
+        .env("CREDHOP_CURSOR", cursor.to_string())
         .current_dir(home)
         .output()
         .unwrap();
@@ -135,5 +142,27 @@ fn does_not_run_code_on_the_command_line() {
         let input = format!("credhop use $(New-Item -Path '{}') ", marker.display());
         complete(shell, &home, &input);
         assert!(!marker.exists(), "{shell} ran the subexpression");
+    }
+}
+
+#[test]
+fn completes_the_word_under_the_cursor() {
+    let dir = tempdir().unwrap();
+    let home = common::unusual_home(dir.path());
+    common::save_profiles(&home, &[("claude", "work"), ("claude", "team")]);
+
+    for shell in shells() {
+        // credhop use cl|aude
+        assert_eq!(
+            complete_at(shell, &home, "credhop use claude", 14),
+            ["claude"],
+            "{shell}"
+        );
+        // credhop use claude w|ork
+        assert_eq!(
+            complete_at(shell, &home, "credhop use claude work", 20),
+            ["work"],
+            "{shell}"
+        );
     }
 }
