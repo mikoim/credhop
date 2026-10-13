@@ -76,7 +76,29 @@ fn atomic_write(path: &Path, bytes: &[u8], permissions: Option<Permissions>) -> 
     }
     // Close the file before renaming it over `path`.
     drop(file);
-    fs::rename(&tmp, path).with_context(|| format!("failed to replace {}", path.display()))
+    if let Err(e) = fs::rename(&tmp, path) {
+        let hint = in_use_hint(&e);
+        return Err(e).with_context(|| format!("failed to replace {}{hint}", path.display()));
+    }
+    Ok(())
+}
+
+/// On Windows a file cannot be replaced while another process has it open.
+#[cfg(windows)]
+fn in_use_hint(e: &io::Error) -> &'static str {
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    match e.raw_os_error() {
+        Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION) => {
+            " (quit Claude Code and Codex, then try again)"
+        }
+        _ => "",
+    }
+}
+
+#[cfg(not(windows))]
+fn in_use_hint(_: &io::Error) -> &'static str {
+    ""
 }
 
 #[cfg(unix)]
@@ -272,5 +294,28 @@ mod tests {
         remove_file_if_exists(&path).unwrap();
 
         assert!(!path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replacing_a_file_in_use_suggests_quitting_the_tools() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.json");
+        fs::write(&path, "{}").unwrap();
+        // Like a running tool that holds the file open without sharing it.
+        let _open = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+
+        let err = write_private_json(&path, &json!({})).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .ends_with(" (quit Claude Code and Codex, then try again)"),
+            "{err:#}"
+        );
     }
 }
