@@ -18,11 +18,15 @@ pub const COMPLETE_VAR: &str = "COMPLETE";
 /// The command the scripts complete and call back, found on `PATH`.
 const BIN: &str = "credhop";
 
+/// credhop's own PowerShell registration script; see `write_registration`.
+const POWERSHELL_REGISTRATION: &str = include_str!("completion.ps1");
+
 /// A shell `credhop completions` can print a script for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Shell {
     Bash,
     Fish,
+    Powershell,
 }
 
 /// Writes the script that makes `shell` ask credhop for completions.
@@ -30,6 +34,13 @@ pub fn write_registration(shell: Shell, out: &mut dyn Write) -> Result<()> {
     let completer: &dyn EnvCompleter = match shell {
         Shell::Bash => &env::Bash,
         Shell::Fish => &env::Fish,
+        // clap's PowerShell script drops the empty word being completed on
+        // Windows PowerShell 5.1 and evaluates the command line with
+        // Invoke-Expression, so credhop ships its own script.
+        Shell::Powershell => {
+            out.write_all(POWERSHELL_REGISTRATION.as_bytes())?;
+            return Ok(());
+        }
     };
     completer.write_registration(COMPLETE_VAR, BIN, BIN, BIN, out)?;
     Ok(())
@@ -126,6 +137,22 @@ mod tests {
             "{fish}"
         );
         assert!(fish.contains("COMPLETE=fish credhop -- "), "{fish}");
+        let powershell = script(Shell::Powershell);
+        assert!(
+            powershell
+                .contains("Register-ArgumentCompleter -Native -CommandName credhop, credhop.exe "),
+            "{powershell}"
+        );
+        assert!(
+            powershell.contains(&format!("$env:{COMPLETE_VAR} = 'powershell'")),
+            "{powershell}"
+        );
+        assert!(
+            powershell.contains(&format!("& {BIN} '--' @words")),
+            "{powershell}"
+        );
+        assert!(!powershell.contains("Invoke-Expression"), "{powershell}");
+        assert!(powershell.is_ascii(), "{powershell}");
     }
 
     #[test]

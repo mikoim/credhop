@@ -124,6 +124,13 @@ mod tests {
             cli.command,
             Command::Completions { shell: Shell::Fish }
         ));
+        let cli = Cli::try_parse_from(["credhop", "completions", "powershell"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Completions {
+                shell: Shell::Powershell
+            }
+        ));
         assert!(Cli::try_parse_from(["credhop", "completions", "zsh"]).is_err());
     }
 }

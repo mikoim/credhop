@@ -46,3 +46,19 @@ fn completes_profile_names_of_the_typed_tool() {
     );
     assert!(complete("fish", &home, &["credhop", "save", "claude", ""]).is_empty());
 }
+
+#[test]
+fn completes_profile_names_for_the_powershell_script() {
+    let dir = tempdir().unwrap();
+    let home = common::unusual_home(dir.path());
+    common::save_profiles(&home, &[("claude", "work"), ("claude", "team")]);
+
+    assert_eq!(
+        complete("powershell", &home, &["credhop", "use", "claude", ""]),
+        ["team", "work"]
+    );
+    assert_eq!(
+        complete("powershell", &home, &["credhop", "use", "claude", "w"]),
+        ["work"]
+    );
+}
