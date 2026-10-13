@@ -3,7 +3,7 @@
 Switch the login credentials of [Claude Code](https://claude.com/claude-code) and
 [Codex](https://github.com/openai/codex) between saved profiles.
 
-Linux only for now.
+Works on Linux and Windows.
 
 ![credhop demo](demo/demo.gif)
 
@@ -51,7 +51,7 @@ credhop save claude team
 
 ## Shell completion
 
-Commands, tools and saved profile names are completed in bash and fish.
+Commands, tools and saved profile names are completed in bash, fish and PowerShell.
 
 ```sh
 # bash: add to ~/.bashrc
@@ -61,6 +61,11 @@ source <(credhop completions bash)
 credhop completions fish > ~/.config/fish/completions/credhop.fish
 ```
 
+```powershell
+# PowerShell (Windows PowerShell 5.1 and PowerShell 7): add to $PROFILE
+credhop completions powershell | Out-String | Invoke-Expression
+```
+
 ## How it works
 
 | Tool | Live credentials |
@@ -68,8 +73,14 @@ credhop completions fish > ~/.config/fish/completions/credhop.fish
 | Claude Code | `~/.claude/.credentials.json` and the `oauthAccount` key of `~/.claude.json` |
 | Codex | `~/.codex/auth.json` |
 
-Profiles are stored in `$XDG_DATA_HOME/credhop` (default `~/.local/share/credhop`)
-with the same `0600` permissions as the original files. They are not encrypted.
+On Windows, `~` is `%USERPROFILE%`.
+
+Profiles are stored in a private directory. They are not encrypted.
+
+| OS | Profiles | Protection |
+|---|---|---|
+| Linux | `$XDG_DATA_HOME/credhop` (default `~/.local/share/credhop`) | `0600` permissions, like the original files |
+| Windows | `%LOCALAPPDATA%\credhop` | the ACL inherited from your user profile, like the original files |
 
 OAuth tokens are refreshed while a tool runs. Before switching, `credhop use`
 writes the current live credentials back to the profile of the same account,
@@ -80,7 +91,10 @@ that is not saved, `use` stops; save it first or pass `--force` to discard it.
 
 - Quit Claude Code and Codex before switching. Running sessions keep the old
   credentials, and Claude Code may overwrite `~/.claude.json` while it runs.
+  On Windows, switching fails while a running tool has a credential file open.
 - `CLAUDE_CONFIG_DIR` and `CODEX_HOME` are not supported.
+- For Codex, only the default `cli_auth_credentials_store = "file"` is
+  supported; credentials kept in the OS keyring are not found.
 - credhop replaces files atomically, so a symlinked `~/.claude.json`,
   `~/.claude/.credentials.json` or `~/.codex/auth.json` becomes a regular file.
 

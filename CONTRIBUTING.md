@@ -1,5 +1,15 @@
 # Contributing
 
+## Running the tests
+
+```sh
+cargo test
+```
+
+The tests run on Linux and Windows. `tests/powershell.rs` completes command
+lines in Windows PowerShell 5.1 and PowerShell 7 (`pwsh`) and skips any that
+is not installed. CI runs the tests on both platforms.
+
 ## Recording the demo
 
 The demo GIF in the README (`demo/demo.gif`) is recorded with
