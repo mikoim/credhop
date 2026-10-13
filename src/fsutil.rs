@@ -17,15 +17,26 @@ pub fn write_private_json(path: &Path, value: &Value) -> Result<()> {
 }
 
 /// Atomically replace `path` with `value` as pretty-printed JSON, keeping the
-/// permissions of the existing file (on Windows, its read-only flag). A new
-/// file is written like [`write_private_json`].
+/// permissions of the existing file on Unix. A new file, and any file on
+/// Windows, is written like [`write_private_json`].
 pub fn replace_json(path: &Path, value: &Value) -> Result<()> {
-    let permissions = match fs::metadata(path) {
-        Ok(metadata) => Some(metadata.permissions()),
-        Err(e) if e.kind() == ErrorKind::NotFound => None,
-        Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
-    };
-    atomic_write(path, &json_bytes(value)?, permissions)
+    atomic_write(path, &json_bytes(value)?, existing_permissions(path)?)
+}
+
+#[cfg(unix)]
+fn existing_permissions(path: &Path) -> Result<Option<Permissions>> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(metadata.permissions())),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+/// Windows permissions are only the read-only flag. A read-only file cannot be
+/// replaced at all, and copying the flag would make the temporary file read-only.
+#[cfg(not(unix))]
+fn existing_permissions(_: &Path) -> Result<Option<Permissions>> {
+    Ok(None)
 }
 
 /// Create `dir` and any missing parents that only the user can access.
@@ -67,8 +78,23 @@ fn atomic_write(path: &Path, bytes: &[u8], permissions: Option<Permissions>) -> 
     let name = path.file_name().context("path has no file name")?;
     let tmp = dir.join(format!(".{}.credhop-tmp", name.to_string_lossy()));
 
-    let mut file =
+    let file =
         create_private_file(&tmp).with_context(|| format!("failed to create {}", tmp.display()))?;
+    let result = write_and_rename(file, bytes, permissions, &tmp, path);
+    if result.is_err() {
+        // Do not leave a copy of the credentials behind.
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn write_and_rename(
+    mut file: File,
+    bytes: &[u8],
+    permissions: Option<Permissions>,
+    tmp: &Path,
+    path: &Path,
+) -> Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     if let Some(permissions) = permissions {
@@ -76,7 +102,7 @@ fn atomic_write(path: &Path, bytes: &[u8], permissions: Option<Permissions>) -> 
     }
     // Close the file before renaming it over `path`.
     drop(file);
-    if let Err(e) = fs::rename(&tmp, path) {
+    if let Err(e) = fs::rename(tmp, path) {
         let hint = in_use_hint(&e);
         return Err(e).with_context(|| format!("failed to replace {}{hint}", path.display()));
     }
@@ -317,5 +343,27 @@ mod tests {
                 .ends_with(" (quit Claude Code and Codex, then try again)"),
             "{err:#}"
         );
+        assert!(!dir.path().join(".a.json.credhop-tmp").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replace_json_on_a_read_only_file_fails_without_leaving_a_temp_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.json");
+        fs::write(&path, "{}").unwrap();
+        let writable = fs::metadata(&path).unwrap().permissions();
+        let mut read_only = writable.clone();
+        read_only.set_readonly(true);
+        fs::set_permissions(&path, read_only).unwrap();
+
+        assert!(replace_json(&path, &json!({"a": 1})).is_err());
+
+        assert_eq!(read_json(&path).unwrap(), Some(json!({})));
+        assert!(!dir.path().join(".a.json.credhop-tmp").exists());
+        // Once the file is writable again, the next write must succeed.
+        fs::set_permissions(&path, writable).unwrap();
+        replace_json(&path, &json!({"a": 1})).unwrap();
+        assert_eq!(read_json(&path).unwrap(), Some(json!({"a": 1})));
     }
 }

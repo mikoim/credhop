@@ -68,11 +68,26 @@ impl Provider for Claude {
             }
             None => None,
         };
+        let previous = read_json(&self.credentials_path())?;
 
         create_private_dir(&self.dir)?;
         write_private_json(&self.credentials_path(), credentials)?;
-        if let Some(config) = config {
-            replace_json(&self.config_path, &config)?;
+        if let Some(config) = config
+            && let Err(e) = replace_json(&self.config_path, &config)
+        {
+            // Put the old credentials back so they stay paired with the old
+            // account; otherwise the next write-back would save the new tokens
+            // into the old account's profile.
+            let restored = match previous {
+                Some(previous) => write_private_json(&self.credentials_path(), &previous),
+                None => remove_file_if_exists(&self.credentials_path()),
+            };
+            return Err(match restored {
+                Ok(()) => e,
+                Err(restore) => e.context(format!(
+                    "the previous credentials could not be restored either: {restore:#}"
+                )),
+            });
         }
         Ok(())
     }
@@ -288,5 +303,67 @@ mod tests {
 
         claude.clear_live().unwrap();
         assert_eq!(mode(&config), 0o644);
+    }
+
+    /// Makes replacing `~/.claude.json` fail, while it stays readable, until the guard is dropped.
+    #[cfg(windows)]
+    fn block_config(home: &Path) -> impl Sized {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        // Like a running tool that holds the file open without FILE_SHARE_DELETE.
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(home.join(".claude.json"))
+            .unwrap()
+    }
+
+    /// Makes replacing `~/.claude.json` fail, while it stays readable, until the guard is dropped.
+    #[cfg(unix)]
+    fn block_config(home: &Path) -> impl Sized {
+        use std::os::unix::fs::PermissionsExt;
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        fs::set_permissions(home, fs::Permissions::from_mode(0o555)).unwrap();
+        Restore(home.to_path_buf())
+    }
+
+    #[test]
+    fn write_live_restores_credentials_when_the_config_cannot_be_replaced() {
+        let home = tempdir().unwrap();
+        let alice = snapshot("a1", "alice");
+        write(
+            &home.path().join(".claude/.credentials.json"),
+            &alice["credentials"],
+        );
+        write(
+            &home.path().join(".claude.json"),
+            &json!({"oauthAccount": alice["oauthAccount"]}),
+        );
+        let claude = Claude::new(home.path());
+
+        let blocked = block_config(home.path());
+        assert!(claude.write_live(&snapshot("b1", "bob")).is_err());
+        drop(blocked);
+
+        assert_eq!(claude.read_live().unwrap(), Some(alice));
+    }
+
+    #[test]
+    fn write_live_removes_new_credentials_when_the_config_cannot_be_replaced() {
+        let home = tempdir().unwrap();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        write(&home.path().join(".claude.json"), &json!({}));
+        let claude = Claude::new(home.path());
+
+        let blocked = block_config(home.path());
+        assert!(claude.write_live(&snapshot("b1", "bob")).is_err());
+        drop(blocked);
+
+        assert!(claude.read_live().unwrap().is_none());
     }
 }
