@@ -80,7 +80,7 @@ fn main() -> Result<()> {
         .complete();
     let cli = Cli::parse();
     let home = std::env::home_dir().context("cannot determine the home directory")?;
-    let store = Store::new(data_root(std::env::var_os("XDG_DATA_HOME"), &home));
+    let store = Store::new(data_root(&home));
     let ctx = Ctx { store, home };
     let mut out = std::io::stdout().lock();
 

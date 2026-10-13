@@ -12,13 +12,35 @@ use serde_json::Value;
 use crate::fsutil::{create_private_dir, read_json, write_private_json};
 use crate::provider::Tool;
 
-/// Returns `$XDG_DATA_HOME/credhop`, or `~/.local/share/credhop` when it is unset or not absolute.
-pub fn data_root(xdg_data_home: Option<OsString>, home: &Path) -> PathBuf {
-    xdg_data_home
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
+/// The directory credhop keeps its profiles in: `$XDG_DATA_HOME/credhop` on Unix
+/// and `%LOCALAPPDATA%\credhop` on Windows, each falling back to its default
+/// under `home` when the variable is unset or not an absolute path.
+#[cfg(unix)]
+pub fn data_root(home: &Path) -> PathBuf {
+    xdg_data_root(std::env::var_os("XDG_DATA_HOME"), home)
+}
+
+#[cfg(windows)]
+pub fn data_root(home: &Path) -> PathBuf {
+    local_app_data_root(std::env::var_os("LOCALAPPDATA"), home)
+}
+
+#[cfg(unix)]
+fn xdg_data_root(xdg_data_home: Option<OsString>, home: &Path) -> PathBuf {
+    absolute(xdg_data_home)
         .unwrap_or_else(|| home.join(".local/share"))
         .join("credhop")
+}
+
+#[cfg(windows)]
+fn local_app_data_root(local_app_data: Option<OsString>, home: &Path) -> PathBuf {
+    absolute(local_app_data)
+        .unwrap_or_else(|| home.join(r"AppData\Local"))
+        .join("credhop")
+}
+
+fn absolute(path: Option<OsString>) -> Option<PathBuf> {
+    path.map(PathBuf::from).filter(|path| path.is_absolute())
 }
 
 /// Profile names become file names, so only allow a safe character set.
@@ -132,25 +154,38 @@ mod tests {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
+    #[cfg(unix)]
     #[test]
-    fn data_root_prefers_absolute_xdg_data_home() {
+    fn xdg_data_root_prefers_absolute_xdg_data_home() {
         let home = Path::new("/home/u");
         assert_eq!(
-            data_root(Some("/xdg".into()), home),
+            xdg_data_root(Some("/xdg".into()), home),
             PathBuf::from("/xdg/credhop")
         );
+        for unusable in [None, Some(""), Some("rel")] {
+            assert_eq!(
+                xdg_data_root(unusable.map(Into::into), home),
+                PathBuf::from("/home/u/.local/share/credhop"),
+                "{unusable:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_app_data_root_prefers_absolute_local_app_data() {
+        let home = Path::new(r"C:\Users\u");
         assert_eq!(
-            data_root(None, home),
-            PathBuf::from("/home/u/.local/share/credhop")
+            local_app_data_root(Some(r"D:\Local".into()), home),
+            PathBuf::from(r"D:\Local\credhop")
         );
-        assert_eq!(
-            data_root(Some("".into()), home),
-            PathBuf::from("/home/u/.local/share/credhop")
-        );
-        assert_eq!(
-            data_root(Some("rel".into()), home),
-            PathBuf::from("/home/u/.local/share/credhop")
-        );
+        for unusable in [None, Some(""), Some("rel"), Some(r"\no-drive")] {
+            assert_eq!(
+                local_app_data_root(unusable.map(Into::into), home),
+                PathBuf::from(r"C:\Users\u\AppData\Local\credhop"),
+                "{unusable:?}"
+            );
+        }
     }
 
     #[test]

@@ -40,7 +40,7 @@ pub fn profile_names() -> Vec<CompletionCandidate> {
     let Some(home) = std::env::home_dir() else {
         return Vec::new();
     };
-    let store = Store::new(data_root(std::env::var_os("XDG_DATA_HOME"), &home));
+    let store = Store::new(data_root(&home));
     let args: Vec<OsString> = std::env::args_os().collect();
     names(&store, typed_tool(&args))
         .into_iter()
