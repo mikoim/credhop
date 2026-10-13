@@ -6,7 +6,7 @@ use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::Value;
 
-use crate::fsutil::{create_private_dir, read_json, remove_file_if_exists, write_json};
+use crate::fsutil::{create_private_dir, read_json, remove_file_if_exists, write_private_json};
 use crate::provider::Provider;
 
 pub struct Codex {
@@ -32,7 +32,7 @@ impl Provider for Codex {
 
     fn write_live(&self, snapshot: &Value) -> Result<()> {
         create_private_dir(&self.dir)?;
-        write_json(&self.auth_path(), snapshot, 0o600)
+        write_private_json(&self.auth_path(), snapshot)
     }
 
     fn clear_live(&self) -> Result<()> {
@@ -85,8 +85,6 @@ fn id_token_claim(snapshot: &Value, claim: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
     fn jwt(claims: Value) -> String {
@@ -107,19 +105,30 @@ mod tests {
     }
 
     #[test]
-    fn live_round_trip_with_private_mode() {
+    fn live_round_trip() {
         let home = tempdir().unwrap();
         let codex = Codex::new(home.path());
         assert!(codex.read_live().unwrap().is_none());
 
         codex.write_live(&chatgpt_auth()).unwrap();
 
+        assert_eq!(codex.read_live().unwrap(), Some(chatgpt_auth()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_file_is_private() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempdir().unwrap();
+
+        Codex::new(home.path()).write_live(&chatgpt_auth()).unwrap();
+
         let path = home.path().join(".codex/auth.json");
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert_eq!(codex.read_live().unwrap(), Some(chatgpt_auth()));
     }
 
     #[test]

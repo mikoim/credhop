@@ -1,13 +1,13 @@
-//! Claude Code provider (Linux: credentials live in files under the home directory).
+//! Claude Code provider (Linux and Windows: credentials live in files under the home directory).
 
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use crate::fsutil::{create_private_dir, read_json, remove_file_if_exists, write_json};
+use crate::fsutil::{
+    create_private_dir, read_json, remove_file_if_exists, replace_json, write_private_json,
+};
 use crate::provider::Provider;
 
 /// Claude Code stores OAuth tokens in `~/.claude/.credentials.json` and the
@@ -64,16 +64,15 @@ impl Provider for Claude {
                         object.shift_remove("oauthAccount");
                     }
                 }
-                let mode = fs::metadata(&self.config_path)?.permissions().mode() & 0o777;
-                Some((config, mode))
+                Some(config)
             }
             None => None,
         };
 
         create_private_dir(&self.dir)?;
-        write_json(&self.credentials_path(), credentials, 0o600)?;
-        if let Some((config, mode)) = config {
-            write_json(&self.config_path, &config, mode)?;
+        write_private_json(&self.credentials_path(), credentials)?;
+        if let Some(config) = config {
+            replace_json(&self.config_path, &config)?;
         }
         Ok(())
     }
@@ -86,8 +85,7 @@ impl Provider for Claude {
             && let Some(object) = config.as_object_mut()
             && object.shift_remove("oauthAccount").is_some()
         {
-            let mode = fs::metadata(&self.config_path)?.permissions().mode() & 0o777;
-            write_json(&self.config_path, &config, mode)?;
+            replace_json(&self.config_path, &config)?;
         }
         Ok(())
     }
@@ -114,17 +112,12 @@ impl Provider for Claude {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::fs;
     use tempfile::tempdir;
 
-    fn mode(path: &Path) -> u32 {
-        fs::metadata(path).unwrap().permissions().mode() & 0o777
-    }
-
-    fn write(path: &Path, value: &Value, mode: u32) {
+    fn write(path: &Path, value: &Value) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, value.to_string()).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
 
     fn snapshot(token: &str, user: &str) -> Value {
@@ -147,12 +140,10 @@ mod tests {
         write(
             &home.path().join(".claude/.credentials.json"),
             &expected["credentials"],
-            0o600,
         );
         write(
             &home.path().join(".claude.json"),
             &json!({"numStartups": 3, "oauthAccount": expected["oauthAccount"]}),
-            0o644,
         );
 
         assert_eq!(
@@ -164,11 +155,7 @@ mod tests {
     #[test]
     fn read_live_uses_null_when_oauth_account_is_missing() {
         let home = tempdir().unwrap();
-        write(
-            &home.path().join(".claude/.credentials.json"),
-            &json!({}),
-            0o600,
-        );
+        write(&home.path().join(".claude/.credentials.json"), &json!({}));
 
         let live = Claude::new(home.path()).read_live().unwrap().unwrap();
         assert!(live["oauthAccount"].is_null());
@@ -181,7 +168,6 @@ mod tests {
         write(
             &config,
             &json!({"zeta": 1, "oauthAccount": {"accountUuid": "old"}, "alpha": 2}),
-            0o644,
         );
 
         let target = snapshot("t2", "bob");
@@ -192,7 +178,6 @@ mod tests {
             read_json(&credentials).unwrap(),
             Some(target["credentials"].clone())
         );
-        assert_eq!(mode(&credentials), 0o600);
         let written = read_json(&config).unwrap().unwrap();
         let keys: Vec<&str> = written
             .as_object()
@@ -202,14 +187,13 @@ mod tests {
             .collect();
         assert_eq!(keys, ["zeta", "oauthAccount", "alpha"]);
         assert_eq!(written["oauthAccount"], target["oauthAccount"]);
-        assert_eq!(mode(&config), 0o644);
     }
 
     #[test]
     fn write_live_removes_oauth_account_when_snapshot_has_none() {
         let home = tempdir().unwrap();
         let config = home.path().join(".claude.json");
-        write(&config, &json!({"a": 1, "oauthAccount": {}, "b": 2}), 0o600);
+        write(&config, &json!({"a": 1, "oauthAccount": {}, "b": 2}));
 
         Claude::new(home.path())
             .write_live(&json!({"credentials": {}, "oauthAccount": null}))
@@ -233,8 +217,8 @@ mod tests {
         let home = tempdir().unwrap();
         let credentials = home.path().join(".claude/.credentials.json");
         let original = json!({"claudeAiOauth": {"accessToken": "old"}});
-        write(&credentials, &original, 0o600);
-        write(&home.path().join(".claude.json"), &json!([]), 0o600);
+        write(&credentials, &original);
+        write(&home.path().join(".claude.json"), &json!([]));
 
         let result = Claude::new(home.path()).write_live(&snapshot("t2", "bob"));
 
@@ -247,11 +231,10 @@ mod tests {
         let home = tempdir().unwrap();
         let credentials = home.path().join(".claude/.credentials.json");
         let config = home.path().join(".claude.json");
-        write(&credentials, &json!({}), 0o600);
+        write(&credentials, &json!({}));
         write(
             &config,
             &json!({"zeta": 1, "oauthAccount": {"accountUuid": "alice"}, "alpha": 2}),
-            0o644,
         );
         let claude = Claude::new(home.path());
 
@@ -262,7 +245,6 @@ mod tests {
             read_json(&config).unwrap(),
             Some(json!({"zeta": 1, "alpha": 2}))
         );
-        assert_eq!(mode(&config), 0o644);
         assert!(claude.read_live().unwrap().is_none());
     }
 
@@ -286,5 +268,25 @@ mod tests {
         let no_org = json!({"oauthAccount": {"accountUuid": "alice"}});
         assert_eq!(claude.account_id(&no_org).as_deref(), Some("alice"));
         assert_eq!(claude.account_id(&json!({"oauthAccount": null})), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credentials_are_private_and_config_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let home = tempdir().unwrap();
+        let credentials = home.path().join(".claude/.credentials.json");
+        let config = home.path().join(".claude.json");
+        write(&config, &json!({"oauthAccount": {"accountUuid": "old"}}));
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+        let claude = Claude::new(home.path());
+
+        claude.write_live(&snapshot("t", "alice")).unwrap();
+        assert_eq!(mode(&credentials), 0o600);
+        assert_eq!(mode(&config), 0o644);
+
+        claude.clear_live().unwrap();
+        assert_eq!(mode(&config), 0o644);
     }
 }

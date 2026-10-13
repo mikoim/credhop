@@ -9,10 +9,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use crate::fsutil::{create_private_dir, read_json, write_json};
+use crate::fsutil::{create_private_dir, read_json, write_private_json};
 use crate::provider::Tool;
-
-const FILE_MODE: u32 = 0o600;
 
 /// Returns `$XDG_DATA_HOME/credhop`, or `~/.local/share/credhop` when it is unset or not absolute.
 pub fn data_root(xdg_data_home: Option<OsString>, home: &Path) -> PathBuf {
@@ -52,7 +50,7 @@ impl Store {
     pub fn save_profile(&self, tool: Tool, name: &str, snapshot: &Value) -> Result<()> {
         let path = self.profile_path(tool, name)?;
         create_private_dir(&self.tool_dir(tool))?;
-        write_json(&path, snapshot, FILE_MODE)
+        write_private_json(&path, snapshot)
     }
 
     /// Returns `false` if the profile did not exist.
@@ -98,11 +96,7 @@ impl Store {
             None => state.remove(tool.as_str()),
         };
         create_private_dir(&self.root)?;
-        write_json(
-            &self.state_path(),
-            &serde_json::to_value(&state)?,
-            FILE_MODE,
-        )
+        write_private_json(&self.state_path(), &serde_json::to_value(&state)?)
     }
 
     fn tool_dir(&self, tool: Tool) -> PathBuf {
@@ -130,10 +124,11 @@ impl Store {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
+    #[cfg(unix)]
     fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
         fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
@@ -169,10 +164,9 @@ mod tests {
     }
 
     #[test]
-    fn profiles_round_trip_with_private_permissions() {
+    fn profiles_round_trip() {
         let dir = tempdir().unwrap();
-        let root = dir.path().join("credhop");
-        let store = Store::new(root.clone());
+        let store = Store::new(dir.path().join("credhop"));
         let snapshot = json!({"token": "t"});
 
         store.save_profile(Tool::Claude, "work", &snapshot).unwrap();
@@ -190,9 +184,6 @@ mod tests {
             ["a-first", "work"]
         );
         assert!(store.list_profiles(Tool::Codex).unwrap().is_empty());
-        assert_eq!(mode(&root), 0o700);
-        assert_eq!(mode(&root.join("profiles/claude")), 0o700);
-        assert_eq!(mode(&root.join("profiles/claude/work.json")), 0o600);
 
         assert!(store.remove_profile(Tool::Claude, "work").unwrap());
         assert!(!store.remove_profile(Tool::Claude, "work").unwrap());
@@ -237,6 +228,23 @@ mod tests {
         store.set_active(Tool::Codex, None).unwrap();
         assert_eq!(store.active(Tool::Codex).unwrap(), None);
         assert_eq!(store.active(Tool::Claude).unwrap().as_deref(), Some("work"));
-        assert_eq!(mode(&dir.path().join("credhop/state.json")), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_files_and_directories_are_private() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("credhop");
+        let store = Store::new(root.clone());
+
+        store
+            .save_profile(Tool::Claude, "work", &json!({}))
+            .unwrap();
+        store.set_active(Tool::Claude, Some("work")).unwrap();
+
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(&root.join("profiles/claude")), 0o700);
+        assert_eq!(mode(&root.join("profiles/claude/work.json")), 0o600);
+        assert_eq!(mode(&root.join("state.json")), 0o600);
     }
 }
