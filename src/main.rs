@@ -5,6 +5,7 @@ mod codex;
 mod commands;
 mod completion;
 mod fsutil;
+mod http;
 mod provider;
 mod store;
 mod time;
