@@ -56,6 +56,21 @@ pub fn read_json(path: &Path) -> Result<Option<Value>> {
     Ok(Some(value))
 }
 
+/// Open `path` for locking, creating it as a private file if missing. Its
+/// content is never written, so an existing file is not truncated.
+pub fn open_lock_file(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))
+}
+
 /// Delete the file at `path`. A missing file is not an error.
 pub fn remove_file_if_exists(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
@@ -317,6 +332,29 @@ mod tests {
                 .to_string()
                 .contains("invalid JSON")
         );
+    }
+
+    #[test]
+    fn open_lock_file_creates_the_file_and_keeps_its_content() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("usage.lock");
+
+        drop(open_lock_file(&path).unwrap());
+        fs::write(&path, "kept").unwrap();
+        drop(open_lock_file(&path).unwrap());
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "kept");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_lock_file_creates_a_private_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("usage.lock");
+
+        drop(open_lock_file(&path).unwrap());
+
+        assert_eq!(mode(&path) & 0o077, 0);
     }
 
     #[test]

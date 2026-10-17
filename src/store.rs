@@ -2,14 +2,14 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, File};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use crate::fsutil::{create_private_dir, read_json, write_private_json};
+use crate::fsutil::{create_private_dir, open_lock_file, read_json, write_private_json};
 use crate::provider::Tool;
 
 /// The directory credhop keeps its profiles in: `$XDG_DATA_HOME/credhop` on Unix
@@ -121,6 +121,17 @@ impl Store {
         write_private_json(&self.state_path(), &serde_json::to_value(&state)?)
     }
 
+    /// Locks the store against other credhop processes until the returned
+    /// file is dropped, waiting while another process holds the lock.
+    pub fn lock(&self) -> Result<File> {
+        create_private_dir(&self.root)?;
+        let path = self.root.join("usage.lock");
+        let file = open_lock_file(&path)?;
+        file.lock()
+            .with_context(|| format!("failed to lock {}", path.display()))?;
+        Ok(file)
+    }
+
     fn tool_dir(&self, tool: Tool) -> PathBuf {
         self.root.join("profiles").join(tool.as_str())
     }
@@ -186,6 +197,23 @@ mod tests {
                 "{unusable:?}"
             );
         }
+    }
+
+    #[test]
+    fn lock_is_exclusive_until_dropped() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("credhop");
+        let store = Store::new(root.clone());
+
+        let held = store.lock().unwrap();
+        let other = fs::File::open(root.join("usage.lock")).unwrap();
+        assert!(matches!(
+            other.try_lock(),
+            Err(fs::TryLockError::WouldBlock)
+        ));
+
+        drop(held);
+        other.try_lock().unwrap();
     }
 
     #[test]
