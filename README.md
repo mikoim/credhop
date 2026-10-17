@@ -46,7 +46,7 @@ credhop usage claude         # every Claude Code account
 credhop usage claude work    # one account
 ```
 
-```
+```text
 claude
 * work             alice@example.com  5h 77% left (resets in 2h13m)  7d 59% left (resets in 3d4h)
   personal         bob@example.com    5h 100% left  7d 88% left (resets in 5d1h)

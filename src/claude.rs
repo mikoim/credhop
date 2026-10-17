@@ -148,33 +148,26 @@ impl Provider for Claude {
             .get("refreshToken")
             .and_then(Value::as_str)
             .context("no refresh token; log in to this account again")?;
-        let scope = oauth
-            .get("scopes")
-            .and_then(Value::as_array)
-            .map(|scopes| {
-                scopes
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .unwrap_or_default();
-        let body = json!({
+        let mut body = json!({
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
             "client_id": CLIENT_ID,
-            "scope": scope,
         });
+        if let Some(scopes) = oauth.get("scopes").and_then(Value::as_array) {
+            let scopes: Vec<&str> = scopes.iter().filter_map(Value::as_str).collect();
+            body["scope"] = scopes.join(" ").into();
+        }
         let response = http.post_json(TOKEN_URL, &body)?;
-        let (Some(access_token), Some(expires_in)) = (
-            response.get("access_token").and_then(Value::as_str),
-            response.get("expires_in").and_then(Value::as_i64),
-        ) else {
+        let Some(access_token) = response.get("access_token").and_then(Value::as_str) else {
             bail!("unexpected response from {}", host(TOKEN_URL));
         };
+        // The old refresh token is spent once a response arrives, so store
+        // whatever rotated even if the lifetimes are missing.
         // Like Claude Code: keep the old refresh token when no new one is returned.
         oauth.insert("accessToken".to_owned(), access_token.into());
-        oauth.insert("expiresAt".to_owned(), ((now + expires_in) * 1000).into());
+        if let Some(seconds) = response.get("expires_in").and_then(Value::as_i64) {
+            oauth.insert("expiresAt".to_owned(), ((now + seconds) * 1000).into());
+        }
         if let Some(token) = response.get("refresh_token").and_then(Value::as_str) {
             oauth.insert("refreshToken".to_owned(), token.into());
         }
@@ -590,6 +583,46 @@ mod tests {
         assert_eq!(oauth["refreshToken"], "r1");
         assert_eq!(oauth["refreshTokenExpiresAt"], 1_800_000_000_000_i64);
         assert_eq!(oauth["expiresAt"], (NOW + 3600) * 1000);
+    }
+
+    #[test]
+    fn refresh_keeps_rotated_tokens_when_expires_in_is_missing() {
+        let http = FakeHttp::new(|_| Ok(json!({"access_token": "a2", "refresh_token": "r2"})));
+
+        let refreshed = Claude::new(Path::new("/unused"))
+            .refresh(&oauth_snapshot(NOW), &http, NOW)
+            .unwrap();
+
+        let oauth = &refreshed["credentials"]["claudeAiOauth"];
+        assert_eq!(oauth["accessToken"], "a2");
+        assert_eq!(oauth["refreshToken"], "r2");
+        assert_eq!(
+            oauth["expiresAt"],
+            oauth_snapshot(NOW)["credentials"]["claudeAiOauth"]["expiresAt"]
+        );
+    }
+
+    #[test]
+    fn refresh_omits_scope_when_no_scopes_are_stored() {
+        let http = FakeHttp::new(|_| Ok(json!({"access_token": "a2", "expires_in": 3600})));
+        let mut snapshot = oauth_snapshot(NOW);
+        snapshot["credentials"]["claudeAiOauth"]
+            .as_object_mut()
+            .unwrap()
+            .remove("scopes");
+
+        Claude::new(Path::new("/unused"))
+            .refresh(&snapshot, &http, NOW)
+            .unwrap();
+
+        assert_eq!(
+            http.requests()[0].payload,
+            Payload::Json(json!({
+                "grant_type": "refresh_token",
+                "refresh_token": "r1",
+                "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+            }))
+        );
     }
 
     #[test]

@@ -36,6 +36,7 @@ enum Outcome {
     Expired,
     Failed(anyhow::Error),
 }
+
 impl Ctx {
     fn provider(&self, tool: Tool) -> Box<dyn Provider> {
         provider_for(tool, &self.home)
@@ -155,7 +156,7 @@ impl Ctx {
             }
             refreshed = match provider.refresh(snapshot, http, now) {
                 Ok(refreshed) => refreshed,
-                Err(e) => return Outcome::Failed(refresh_error(e)),
+                Err(e) => return Outcome::Failed(refresh_error(e, row.tool, &row.name)),
             };
             // Save at once: the old refresh token no longer works.
             if let Err(e) = self.store.save_profile(row.tool, &row.name, &refreshed) {
@@ -182,14 +183,14 @@ fn label(provider: &dyn Provider, snapshot: &Value) -> String {
 }
 
 /// A rejected refresh token (HTTP 400 or 401) means logging in again.
-fn refresh_error(e: anyhow::Error) -> anyhow::Error {
+fn refresh_error(e: anyhow::Error, tool: Tool, name: &str) -> anyhow::Error {
     if let Some(&StatusError {
         status: status @ (400 | 401),
         ..
     }) = e.downcast_ref::<StatusError>()
     {
         return anyhow!(
-            "token refresh failed (HTTP {status}); log in to this account again and run `credhop save`"
+            "token refresh failed (HTTP {status}); log in to this account again and run `credhop save {tool} {name} --force`"
         );
     }
     e.context("token refresh failed")
@@ -822,6 +823,46 @@ mod tests {
         assert_eq!(requests[1].header("Authorization"), Some("Bearer a2"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn usage_reports_tokens_that_were_refreshed_but_could_not_be_saved() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Restore(std::path::PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        let (_home, ctx) = setup();
+        save_claude_profile(&ctx, "work", "alice", "a1", NOW - 10);
+        let profiles = ctx.home.join("data/profiles/claude");
+        fs::set_permissions(&profiles, fs::Permissions::from_mode(0o555)).unwrap();
+        let _restore = Restore(profiles);
+        let http = FakeHttp::new(|request| match (request.method, request.url.as_str()) {
+            ("POST", CLAUDE_TOKEN) => Ok(json!({
+                "access_token": "a2",
+                "refresh_token": "refresh-a2",
+                "expires_in": 28_800,
+            })),
+            _ => Err(500),
+        });
+        let mut out = Vec::new();
+
+        let err = usage(&ctx, &http, Some(Tool::Claude), None, NOW, &mut out).unwrap_err();
+
+        assert_eq!(err.to_string(), "could not get the usage of 1 account(s)");
+        let out = String::from_utf8(out).unwrap();
+        let detail = out
+            .strip_prefix("claude\n  work             alice@example.com  error: ")
+            .unwrap();
+        assert!(
+            detail.starts_with("tokens were refreshed but saving the profile failed: "),
+            "{detail}"
+        );
+        assert!(detail.ends_with("; log in again\n"), "{detail}");
+        assert_eq!(http.requests().len(), 1); // no usage request
+    }
+
     #[test]
     fn usage_never_refreshes_the_live_credentials() {
         let (_home, ctx) = setup();
@@ -874,7 +915,7 @@ mod tests {
 
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "claude\n  work             alice@example.com  error: token refresh failed (HTTP 400); log in to this account again and run `credhop save`\n"
+            "claude\n  work             alice@example.com  error: token refresh failed (HTTP 400); log in to this account again and run `credhop save claude work --force`\n"
         );
         assert_eq!(profile_token(&ctx, "work"), "a1");
     }
