@@ -2,13 +2,21 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::fsutil::{
     create_private_dir, read_json, remove_file_if_exists, replace_json, write_private_json,
 };
-use crate::provider::Provider;
+use crate::http::{Http, host};
+use crate::provider::{EXPIRY_MARGIN_SECS, Provider};
+use crate::time::parse_rfc3339;
+use crate::usage::{Usage, Window};
+
+const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+/// Claude Code's OAuth client id.
+const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 /// Claude Code stores OAuth tokens in `~/.claude/.credentials.json` and the
 /// account metadata in the `oauthAccount` key of `~/.claude.json`.
@@ -122,6 +130,105 @@ impl Provider for Claude {
             .and_then(Value::as_str)
             .map(str::to_owned)
     }
+
+    fn token_expired(&self, snapshot: &Value, now: i64) -> bool {
+        snapshot
+            .pointer("/credentials/claudeAiOauth/expiresAt")
+            .and_then(Value::as_i64)
+            .is_some_and(|expires_at_ms| expires_at_ms <= (now + EXPIRY_MARGIN_SECS) * 1000)
+    }
+
+    fn refresh(&self, snapshot: &Value, http: &dyn Http, now: i64) -> Result<Value> {
+        let mut refreshed = snapshot.clone();
+        let oauth = refreshed
+            .pointer_mut("/credentials/claudeAiOauth")
+            .and_then(Value::as_object_mut)
+            .context("no refresh token; log in to this account again")?;
+        let refresh_token = oauth
+            .get("refreshToken")
+            .and_then(Value::as_str)
+            .context("no refresh token; log in to this account again")?;
+        let scope = oauth
+            .get("scopes")
+            .and_then(Value::as_array)
+            .map(|scopes| {
+                scopes
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        let body = json!({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": CLIENT_ID,
+            "scope": scope,
+        });
+        let response = http.post_json(TOKEN_URL, &body)?;
+        let (Some(access_token), Some(expires_in)) = (
+            response.get("access_token").and_then(Value::as_str),
+            response.get("expires_in").and_then(Value::as_i64),
+        ) else {
+            bail!("unexpected response from {}", host(TOKEN_URL));
+        };
+        // Like Claude Code: keep the old refresh token when no new one is returned.
+        oauth.insert("accessToken".to_owned(), access_token.into());
+        oauth.insert("expiresAt".to_owned(), ((now + expires_in) * 1000).into());
+        if let Some(token) = response.get("refresh_token").and_then(Value::as_str) {
+            oauth.insert("refreshToken".to_owned(), token.into());
+        }
+        if let Some(seconds) = response
+            .get("refresh_token_expires_in")
+            .and_then(Value::as_i64)
+        {
+            oauth.insert(
+                "refreshTokenExpiresAt".to_owned(),
+                ((now + seconds) * 1000).into(),
+            );
+        }
+        Ok(refreshed)
+    }
+
+    fn usage(&self, snapshot: &Value, http: &dyn Http) -> Result<Option<Usage>> {
+        let token = snapshot
+            .pointer("/credentials/claudeAiOauth/accessToken")
+            .and_then(Value::as_str)
+            .context("no access token; log in to this account again")?;
+        let authorization = format!("Bearer {token}");
+        let response = http.get_json(USAGE_URL, &[("Authorization", authorization.as_str())])?;
+        let limits = response
+            .get("limits")
+            .and_then(Value::as_array)
+            .with_context(|| format!("unexpected response from {}", host(USAGE_URL)))?;
+        let windows: Vec<Window> = limits.iter().filter_map(window).collect();
+        Ok((!windows.is_empty()).then_some(Usage { windows }))
+    }
+}
+
+/// An entry of `limits` in the usage response, if it is a 5-hour (`session`)
+/// or weekly limit. Limits scoped to a model carry the model's name.
+fn window(limit: &Value) -> Option<Window> {
+    let length = match limit.get("group")?.as_str()? {
+        "session" => "5h",
+        "weekly" => "7d",
+        _ => return None,
+    };
+    let label = match limit
+        .pointer("/scope/model/display_name")
+        .and_then(Value::as_str)
+    {
+        Some(model) => format!("{length} {model}"),
+        None => length.to_owned(),
+    };
+    Some(Window {
+        label,
+        used_percent: limit.get("percent")?.as_f64()?,
+        resets_at: limit
+            .get("resets_at")
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339),
+    })
 }
 
 #[cfg(test)]
@@ -365,5 +472,227 @@ mod tests {
         drop(blocked);
 
         assert!(claude.read_live().unwrap().is_none());
+    }
+
+    use crate::http::fake::{FakeHttp, Payload};
+    use crate::usage::{Usage, Window};
+
+    const NOW: i64 = 1_792_200_000;
+
+    /// A profile as Claude Code writes it, with access token `a1` and refresh token `r1`.
+    fn oauth_snapshot(expires_at: i64) -> Value {
+        json!({
+            "credentials": {"claudeAiOauth": {
+                "accessToken": "a1",
+                "refreshToken": "r1",
+                "expiresAt": expires_at * 1000,
+                "refreshTokenExpiresAt": 1_800_000_000_000_i64,
+                "scopes": ["user:inference", "user:profile"],
+                "subscriptionType": "team",
+            }},
+            "oauthAccount": {"accountUuid": "alice", "emailAddress": "alice@example.com"},
+        })
+    }
+
+    /// An anonymized response of the real usage endpoint.
+    fn usage_response() -> Value {
+        json!({
+            "five_hour": {"utilization": 2.0, "resets_at": "2026-10-17T07:59:59.858856+00:00"},
+            "seven_day": null,
+            "limits": [
+                {"kind": "session", "group": "session", "percent": 2, "severity": "normal",
+                 "resets_at": "2026-10-17T07:59:59.858856+00:00", "scope": null, "is_active": true},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 0, "severity": "normal",
+                 "resets_at": "2026-10-20T16:00:00+00:00",
+                 "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null},
+                 "is_active": false},
+            ],
+            "spend": {"percent": 0, "enabled": false},
+        })
+    }
+
+    #[test]
+    fn token_expired_reads_expires_at_in_milliseconds() {
+        let claude = Claude::new(Path::new("/unused"));
+
+        assert!(!claude.token_expired(&oauth_snapshot(NOW + 61), NOW));
+        assert!(claude.token_expired(&oauth_snapshot(NOW + 60), NOW));
+        assert!(!claude.token_expired(&snapshot("t", "alice"), NOW));
+    }
+
+    #[test]
+    fn refresh_replaces_only_the_token_fields() {
+        let http = FakeHttp::new(|_| {
+            Ok(json!({
+                "token_type": "Bearer",
+                "access_token": "a2",
+                "refresh_token": "r2",
+                "expires_in": 28_800,
+                "refresh_token_expires_in": 2_592_000,
+                "scope": "user:inference user:profile",
+            }))
+        });
+
+        let refreshed = Claude::new(Path::new("/unused"))
+            .refresh(&oauth_snapshot(NOW), &http, NOW)
+            .unwrap();
+
+        let mut expected = oauth_snapshot(NOW);
+        let oauth = &mut expected["credentials"]["claudeAiOauth"];
+        oauth["accessToken"] = json!("a2");
+        oauth["refreshToken"] = json!("r2");
+        oauth["expiresAt"] = json!((NOW + 28_800) * 1000);
+        oauth["refreshTokenExpiresAt"] = json!((NOW + 2_592_000) * 1000);
+        assert_eq!(refreshed, expected);
+        let keys: Vec<&str> = refreshed["credentials"]["claudeAiOauth"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "accessToken",
+                "refreshToken",
+                "expiresAt",
+                "refreshTokenExpiresAt",
+                "scopes",
+                "subscriptionType"
+            ]
+        );
+        let requests = http.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            (requests[0].method, requests[0].url.as_str()),
+            ("POST", "https://platform.claude.com/v1/oauth/token")
+        );
+        assert_eq!(
+            requests[0].payload,
+            Payload::Json(json!({
+                "grant_type": "refresh_token",
+                "refresh_token": "r1",
+                "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+                "scope": "user:inference user:profile",
+            }))
+        );
+    }
+
+    #[test]
+    fn refresh_keeps_the_refresh_token_when_none_is_returned() {
+        let http = FakeHttp::new(|_| Ok(json!({"access_token": "a2", "expires_in": 3600})));
+
+        let refreshed = Claude::new(Path::new("/unused"))
+            .refresh(&oauth_snapshot(NOW), &http, NOW)
+            .unwrap();
+
+        let oauth = &refreshed["credentials"]["claudeAiOauth"];
+        assert_eq!(oauth["refreshToken"], "r1");
+        assert_eq!(oauth["refreshTokenExpiresAt"], 1_800_000_000_000_i64);
+        assert_eq!(oauth["expiresAt"], (NOW + 3600) * 1000);
+    }
+
+    #[test]
+    fn refresh_fails_without_a_refresh_token_or_with_an_unexpected_response() {
+        let http = FakeHttp::new(|_| Ok(json!({"error": "nope"})));
+        let claude = Claude::new(Path::new("/unused"));
+
+        let err = claude
+            .refresh(&snapshot("t", "alice"), &http, NOW)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "no refresh token; log in to this account again"
+        );
+        assert!(http.requests().is_empty());
+
+        let err = claude
+            .refresh(&oauth_snapshot(NOW), &http, NOW)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "unexpected response from platform.claude.com"
+        );
+    }
+
+    #[test]
+    fn usage_reads_the_session_and_weekly_limits() {
+        let http = FakeHttp::new(|_| Ok(usage_response()));
+
+        let usage = Claude::new(Path::new("/unused"))
+            .usage(&oauth_snapshot(NOW), &http)
+            .unwrap();
+
+        assert_eq!(
+            usage,
+            Some(Usage {
+                windows: vec![
+                    Window {
+                        label: "5h".to_owned(),
+                        used_percent: 2.0,
+                        resets_at: Some(1_792_223_999),
+                    },
+                    Window {
+                        label: "7d Fable".to_owned(),
+                        used_percent: 0.0,
+                        resets_at: Some(1_792_512_000),
+                    },
+                ]
+            })
+        );
+        let requests = http.requests();
+        assert_eq!(
+            (requests[0].method, requests[0].url.as_str()),
+            ("GET", "https://api.anthropic.com/api/oauth/usage")
+        );
+        assert_eq!(requests[0].header("Authorization"), Some("Bearer a1"));
+    }
+
+    #[test]
+    fn usage_labels_unscoped_weekly_limits_and_skips_other_groups() {
+        let http = FakeHttp::new(|_| {
+            Ok(json!({"limits": [
+                {"group": "weekly", "percent": 41, "resets_at": null, "scope": null},
+                {"group": "spend", "percent": 10, "resets_at": null},
+            ]}))
+        });
+
+        let usage = Claude::new(Path::new("/unused"))
+            .usage(&oauth_snapshot(NOW), &http)
+            .unwrap();
+
+        assert_eq!(
+            usage,
+            Some(Usage {
+                windows: vec![Window {
+                    label: "7d".to_owned(),
+                    used_percent: 41.0,
+                    resets_at: None,
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn usage_without_limits_or_without_a_token() {
+        let claude = Claude::new(Path::new("/unused"));
+        let empty = FakeHttp::new(|_| Ok(json!({"limits": []})));
+        let unexpected = FakeHttp::new(|_| Ok(json!({"five_hour": null})));
+
+        assert_eq!(claude.usage(&oauth_snapshot(NOW), &empty).unwrap(), None);
+        assert_eq!(
+            claude
+                .usage(&oauth_snapshot(NOW), &unexpected)
+                .unwrap_err()
+                .to_string(),
+            "unexpected response from api.anthropic.com"
+        );
+        assert_eq!(
+            claude
+                .usage(&json!({"credentials": {}}), &empty)
+                .unwrap_err()
+                .to_string(),
+            "no access token; log in to this account again"
+        );
     }
 }

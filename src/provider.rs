@@ -9,6 +9,12 @@ use serde_json::Value;
 
 use crate::claude::Claude;
 use crate::codex::Codex;
+use crate::http::Http;
+use crate::usage::Usage;
+
+/// Access tokens this close to expiring count as expired, so they cannot
+/// expire during the request.
+pub const EXPIRY_MARGIN_SECS: i64 = 60;
 
 /// A tool whose credentials credhop manages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -36,7 +42,8 @@ impl fmt::Display for Tool {
     }
 }
 
-/// Reads and writes the live credentials of one tool.
+/// Reads and writes the live credentials of one tool, and queries the
+/// account they belong to.
 ///
 /// Platform-specific storage (files, macOS Keychain, ...) lives behind this trait.
 pub trait Provider {
@@ -50,6 +57,13 @@ pub trait Provider {
     fn account_id(&self, snapshot: &Value) -> Option<String>;
     /// Human-readable label for `status` and `list` (e.g. an email address).
     fn display(&self, snapshot: &Value) -> Option<String>;
+    /// Whether the access token in `snapshot` expires within
+    /// [`EXPIRY_MARGIN_SECS`] of `now` (Unix seconds); false when unknown.
+    fn token_expired(&self, snapshot: &Value, now: i64) -> bool;
+    /// Exchanges the refresh token for new tokens and returns the updated snapshot.
+    fn refresh(&self, snapshot: &Value, http: &dyn Http, now: i64) -> Result<Value>;
+    /// The subscription usage of the account; None when it has no subscription limits.
+    fn usage(&self, snapshot: &Value, http: &dyn Http) -> Result<Option<Usage>>;
 }
 
 /// Returns the provider for `tool` rooted at the user's home directory.
