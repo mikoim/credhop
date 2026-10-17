@@ -7,6 +7,7 @@ mod completion;
 mod fsutil;
 mod provider;
 mod store;
+mod time;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
