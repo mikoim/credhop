@@ -44,6 +44,10 @@ fn completes_profile_names_of_the_typed_tool() {
         complete("fish", &home, &["credhop", "remove", "codex", ""]),
         ["personal"]
     );
+    assert_eq!(
+        complete("fish", &home, &["credhop", "usage", "claude", ""]),
+        ["team", "work"]
+    );
     assert!(complete("fish", &home, &["credhop", "save", "claude", ""]).is_empty());
 }
 

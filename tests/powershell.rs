@@ -104,6 +104,7 @@ fn completes_subcommands_and_profile_names() {
             "logout",
             "remove",
             "status",
+            "usage",
             "completions",
         ] {
             assert!(

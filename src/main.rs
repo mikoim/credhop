@@ -11,12 +11,15 @@ mod store;
 mod time;
 mod usage;
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{ArgValueCandidates, CompleteEnv};
 
 use crate::commands::Ctx;
 use crate::completion::Shell;
+use crate::http::Ureq;
 use crate::provider::Tool;
 use crate::store::{Store, data_root};
 
@@ -70,6 +73,13 @@ enum Command {
     },
     /// Show the current account of each tool
     Status,
+    /// Show how much of the subscription usage limits is left for each account
+    Usage {
+        #[arg(value_enum)]
+        tool: Option<Tool>,
+        #[arg(add = ArgValueCandidates::new(completion::profile_names))]
+        name: Option<String>,
+    },
     /// Print the shell completion script
     Completions {
         #[arg(value_enum)]
@@ -96,8 +106,24 @@ fn main() -> Result<()> {
         Command::Logout { tool, force } => commands::logout(&ctx, tool, force, &mut out),
         Command::Remove { tool, name } => commands::remove(&ctx, tool, &name, &mut out),
         Command::Status => commands::status(&ctx, &mut out),
+        Command::Usage { tool, name } => commands::usage(
+            &ctx,
+            &Ureq::default(),
+            tool,
+            name.as_deref(),
+            unix_now()?,
+            &mut out,
+        ),
         Command::Completions { shell } => completion::write_registration(shell, &mut out),
     }
+}
+
+/// The current time in Unix seconds.
+fn unix_now() -> Result<i64> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("the system clock is set before 1970")?;
+    Ok(i64::try_from(elapsed.as_secs())?)
 }
 
 #[cfg(test)]
@@ -118,6 +144,31 @@ mod tests {
             Command::Use { tool: Tool::Codex, ref name, force: true } if name == "personal"
         ));
         assert!(Cli::try_parse_from(["credhop", "use", "gemini", "x"]).is_err());
+    }
+
+    #[test]
+    fn parses_usage_command() {
+        let cli = Cli::try_parse_from(["credhop", "usage"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Usage {
+                tool: None,
+                name: None
+            }
+        ));
+        let cli = Cli::try_parse_from(["credhop", "usage", "claude"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Usage {
+                tool: Some(Tool::Claude),
+                name: None
+            }
+        ));
+        let cli = Cli::try_parse_from(["credhop", "usage", "codex", "work"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Usage { tool: Some(Tool::Codex), name: Some(ref name) } if name == "work"
+        ));
     }
 
     #[test]

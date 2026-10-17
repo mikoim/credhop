@@ -46,7 +46,7 @@ pub fn write_registration(shell: Shell, out: &mut dyn Write) -> Result<()> {
     Ok(())
 }
 
-/// Candidates for `<name>` of `use` and `remove`: the saved profiles of the typed tool.
+/// Candidates for `<name>` of `use`, `remove` and `usage`: the saved profiles of the typed tool.
 pub fn profile_names() -> Vec<CompletionCandidate> {
     let Some(home) = std::env::home_dir() else {
         return Vec::new();

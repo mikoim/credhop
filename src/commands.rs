@@ -2,12 +2,15 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::thread;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 
+use crate::http::{Http, StatusError};
 use crate::provider::{Provider, Tool, provider_for};
 use crate::store::Store;
+use crate::usage::{Usage, format_windows};
 
 /// Everything a command needs: the profile store and the home directory of the live credentials.
 pub struct Ctx {
@@ -15,6 +18,24 @@ pub struct Ctx {
     pub home: PathBuf,
 }
 
+/// One account `usage` reports on.
+struct Row {
+    tool: Tool,
+    /// The profile name, or `(unsaved)`.
+    name: String,
+    /// The credentials to query with: the live ones for the live account.
+    snapshot: Value,
+    /// Whether `snapshot` holds the live credentials, which credhop never refreshes.
+    live: bool,
+}
+
+/// What `usage` found out about one account.
+enum Outcome {
+    Limits(Usage),
+    NoLimits,
+    Expired,
+    Failed(anyhow::Error),
+}
 impl Ctx {
     fn provider(&self, tool: Tool) -> Box<dyn Provider> {
         provider_for(tool, &self.home)
@@ -68,6 +89,88 @@ impl Ctx {
             ),
         }
     }
+
+    /// The accounts of `tool` that `usage` reports on: the profile `name`, or
+    /// every profile plus the live account when it is not saved.
+    fn usage_rows(&self, tool: Tool, name: Option<&str>) -> Result<Vec<Row>> {
+        let provider = self.provider(tool);
+        let live = provider.read_live()?;
+        let live_id = live.as_ref().and_then(|live| provider.account_id(live));
+        let profile_names = match name {
+            Some(name) => vec![name.to_owned()],
+            None => self.store.list_profiles(tool)?,
+        };
+        let mut rows = Vec::new();
+        for profile_name in profile_names {
+            let profile = self
+                .store
+                .load_profile(tool, &profile_name)?
+                .with_context(|| format!("profile '{tool}/{profile_name}' not found"))?;
+            // The live credentials hold the tokens the tool rotated since the last switch.
+            let row = match &live {
+                Some(live) if live_id.is_some() && provider.account_id(&profile) == live_id => {
+                    Row {
+                        tool,
+                        name: profile_name,
+                        snapshot: live.clone(),
+                        live: true,
+                    }
+                }
+                _ => Row {
+                    tool,
+                    name: profile_name,
+                    snapshot: profile,
+                    live: false,
+                },
+            };
+            rows.push(row);
+        }
+        if name.is_none()
+            && let Some(live) = live
+            && !rows.iter().any(|row| row.live)
+        {
+            rows.insert(
+                0,
+                Row {
+                    tool,
+                    name: "(unsaved)".to_owned(),
+                    snapshot: live,
+                    live: true,
+                },
+            );
+        }
+        Ok(rows)
+    }
+
+    /// Queries the usage of one account, first refreshing and saving the
+    /// tokens of a profile whose access token expired.
+    fn fetch_usage(&self, row: &Row, http: &dyn Http, now: i64) -> Outcome {
+        let provider = self.provider(row.tool);
+        let refreshed;
+        let mut snapshot = &row.snapshot;
+        if provider.token_expired(snapshot, now) {
+            // The running tool may be refreshing the live credentials at the same time.
+            if row.live {
+                return Outcome::Expired;
+            }
+            refreshed = match provider.refresh(snapshot, http, now) {
+                Ok(refreshed) => refreshed,
+                Err(e) => return Outcome::Failed(refresh_error(e)),
+            };
+            // Save at once: the old refresh token no longer works.
+            if let Err(e) = self.store.save_profile(row.tool, &row.name, &refreshed) {
+                return Outcome::Failed(anyhow!(
+                    "tokens were refreshed but saving the profile failed: {e:#}; log in again"
+                ));
+            }
+            snapshot = &refreshed;
+        }
+        match provider.usage(snapshot, http) {
+            Ok(Some(usage)) => Outcome::Limits(usage),
+            Ok(None) => Outcome::NoLimits,
+            Err(e) => Outcome::Failed(usage_error(e)),
+        }
+    }
 }
 
 /// `" (alice@example.com)"`, or an empty string when there is no label.
@@ -76,6 +179,28 @@ fn label(provider: &dyn Provider, snapshot: &Value) -> String {
         .display(snapshot)
         .map(|display| format!(" ({display})"))
         .unwrap_or_default()
+}
+
+/// A rejected refresh token (HTTP 400 or 401) means logging in again.
+fn refresh_error(e: anyhow::Error) -> anyhow::Error {
+    if let Some(&StatusError {
+        status: status @ (400 | 401),
+        ..
+    }) = e.downcast_ref::<StatusError>()
+    {
+        return anyhow!(
+            "token refresh failed (HTTP {status}); log in to this account again and run `credhop save`"
+        );
+    }
+    e.context("token refresh failed")
+}
+
+/// HTTP 401 means the saved tokens no longer work.
+fn usage_error(e: anyhow::Error) -> anyhow::Error {
+    if let Some(StatusError { status: 401, host }) = e.downcast_ref::<StatusError>() {
+        return anyhow!("unauthorized (HTTP 401 from {host}); log in to this account again");
+    }
+    e
 }
 
 pub fn list(ctx: &Ctx, out: &mut dyn Write) -> Result<()> {
@@ -213,6 +338,84 @@ pub fn status(ctx: &Ctx, out: &mut dyn Write) -> Result<()> {
             }
         };
         writeln!(out, "{tool:<7} {line}")?;
+    }
+    Ok(())
+}
+
+/// Shows how much of the subscription usage limits is left for the profile
+/// `name` of `tool`, or for every account. `name` is only given with `tool`.
+pub fn usage(
+    ctx: &Ctx,
+    http: &dyn Http,
+    tool: Option<Tool>,
+    name: Option<&str>,
+    now: i64,
+    out: &mut dyn Write,
+) -> Result<()> {
+    // Refresh tokens work once: without the lock, two runs at the same time
+    // could refresh a profile with the same token and break it.
+    let _lock = ctx.store.lock()?;
+    let tools = tool.as_ref().map_or(&Tool::ALL[..], std::slice::from_ref);
+    let mut rows = Vec::new();
+    for &tool in tools {
+        rows.extend(ctx.usage_rows(tool, name)?);
+    }
+    let outcomes: Vec<Outcome> = thread::scope(|scope| {
+        let handles: Vec<_> = rows
+            .iter()
+            .map(|row| scope.spawn(move || ctx.fetch_usage(row, http, now)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    });
+
+    let displays: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            ctx.provider(row.tool)
+                .display(&row.snapshot)
+                .unwrap_or_default()
+        })
+        .collect();
+    let width = displays
+        .iter()
+        .map(|display| display.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut failed = 0;
+    for &tool in tools {
+        writeln!(out, "{tool}")?;
+        let mut empty = true;
+        for ((row, outcome), display) in rows.iter().zip(&outcomes).zip(&displays) {
+            if row.tool != tool {
+                continue;
+            }
+            empty = false;
+            let detail = match outcome {
+                Outcome::Limits(usage) => format_windows(&usage.windows, now),
+                Outcome::NoLimits => "no subscription limits".to_owned(),
+                Outcome::Expired => format!("access token expired; run {tool} to refresh it"),
+                Outcome::Failed(e) => {
+                    failed += 1;
+                    format!("error: {e:#}")
+                }
+            };
+            let marker = if row.live { '*' } else { ' ' };
+            let line = format!("{marker} {:<16} {display:<width$}  {detail}", row.name);
+            writeln!(out, "{}", line.trim_end())?;
+        }
+        if empty {
+            writeln!(out, "  (no profiles)")?;
+        }
+    }
+    if failed > 0 {
+        bail!("could not get the usage of {failed} account(s)");
     }
     Ok(())
 }
@@ -511,5 +714,225 @@ mod tests {
         assert!(
             output(|out| status(&ctx, out)).starts_with("claude  (unsaved) (carol@example.com)\n")
         );
+    }
+
+    use crate::http::fake::FakeHttp;
+    use crate::time::format_rfc3339;
+
+    const NOW: i64 = 1_792_200_000;
+    const CLAUDE_TOKEN: &str = "https://platform.claude.com/v1/oauth/token";
+
+    /// Saves a Claude profile for `user` with access token `token`, expiring at `expires_at`.
+    fn save_claude_profile(ctx: &Ctx, name: &str, user: &str, token: &str, expires_at: i64) {
+        let profile = json!({
+            "credentials": {"claudeAiOauth": {
+                "accessToken": token,
+                "refreshToken": format!("refresh-{token}"),
+                "expiresAt": expires_at * 1000,
+            }},
+            "oauthAccount": {"accountUuid": user, "emailAddress": format!("{user}@example.com")},
+        });
+        ctx.store
+            .save_profile(Tool::Claude, name, &profile)
+            .unwrap();
+    }
+
+    /// Makes the live Claude access token expire at `expires_at`.
+    fn expire_live_claude(ctx: &Ctx, expires_at: i64) {
+        let path = ctx.home.join(".claude/.credentials.json");
+        let mut credentials: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        credentials["claudeAiOauth"]["expiresAt"] = json!(expires_at * 1000);
+        fs::write(path, credentials.to_string()).unwrap();
+    }
+
+    /// A Claude usage response with one 5-hour window.
+    fn session_usage(percent: u32, resets_in: i64) -> Value {
+        json!({"limits": [
+            {"group": "session", "percent": percent, "resets_at": format_rfc3339(NOW + resets_in)},
+        ]})
+    }
+
+    #[test]
+    fn usage_queries_every_account_and_the_live_one_with_live_tokens() {
+        let (_home, ctx) = setup();
+        login_claude(&ctx, "alice", "a1");
+        save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+        login_claude(&ctx, "bob", "b1");
+        save(&ctx, Tool::Claude, "personal", false, &mut Vec::new()).unwrap();
+        login_claude(&ctx, "bob", "b2"); // Claude Code refreshed the token.
+        let http = FakeHttp::new(|request| match request.header("Authorization") {
+            Some("Bearer a1") => Ok(session_usage(23, 7980)),
+            Some("Bearer b2") => Ok(session_usage(0, 3600)),
+            _ => Err(401),
+        });
+
+        let out = output(|out| usage(&ctx, &http, None, None, NOW, out));
+
+        assert_eq!(
+            out,
+            concat!(
+                "claude\n",
+                "* personal         bob@example.com    5h 100% left (resets in 1h0m)\n",
+                "  work             alice@example.com  5h 77% left (resets in 2h13m)\n",
+                "codex\n",
+                "  (no profiles)\n",
+            )
+        );
+        assert!(
+            http.requests()
+                .iter()
+                .all(|request| request.method == "GET")
+        );
+        assert_eq!(profile_token(&ctx, "personal"), "b1"); // nothing written back
+    }
+
+    #[test]
+    fn usage_refreshes_an_expired_profile_and_saves_it_first() {
+        let (_home, ctx) = setup();
+        save_claude_profile(&ctx, "work", "alice", "a1", NOW - 10);
+        let http = FakeHttp::new(|request| match (request.method, request.url.as_str()) {
+            ("POST", CLAUDE_TOKEN) => Ok(json!({
+                "access_token": "a2",
+                "refresh_token": "refresh-a2",
+                "expires_in": 28_800,
+            })),
+            _ => Err(500),
+        });
+        let mut out = Vec::new();
+
+        let err = usage(&ctx, &http, Some(Tool::Claude), None, NOW, &mut out).unwrap_err();
+
+        assert_eq!(err.to_string(), "could not get the usage of 1 account(s)");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "claude\n  work             alice@example.com  error: HTTP 500 from api.anthropic.com\n"
+        );
+        assert_eq!(profile_token(&ctx, "work"), "a2");
+        let profile = ctx
+            .store
+            .load_profile(Tool::Claude, "work")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            profile["credentials"]["claudeAiOauth"]["refreshToken"],
+            "refresh-a2"
+        );
+        let requests = http.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].header("Authorization"), Some("Bearer a2"));
+    }
+
+    #[test]
+    fn usage_never_refreshes_the_live_credentials() {
+        let (_home, ctx) = setup();
+        login_claude(&ctx, "alice", "a1");
+        save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+        expire_live_claude(&ctx, NOW - 10);
+        let http = FakeHttp::new(|_| Err(500));
+
+        let out = output(|out| usage(&ctx, &http, Some(Tool::Claude), None, NOW, out));
+
+        assert_eq!(
+            out,
+            "claude\n* work             alice@example.com  access token expired; run claude to refresh it\n"
+        );
+        assert!(http.requests().is_empty());
+    }
+
+    #[test]
+    fn usage_reports_each_failure_and_still_shows_the_other_accounts() {
+        let (_home, ctx) = setup();
+        save_claude_profile(&ctx, "work", "alice", "a1", NOW + 3600);
+        save_claude_profile(&ctx, "team", "bob", "b1", NOW + 3600);
+        let http = FakeHttp::new(|request| match request.header("Authorization") {
+            Some("Bearer a1") => Ok(session_usage(50, 60)),
+            _ => Err(401),
+        });
+        let mut out = Vec::new();
+
+        let err = usage(&ctx, &http, Some(Tool::Claude), None, NOW, &mut out).unwrap_err();
+
+        assert_eq!(err.to_string(), "could not get the usage of 1 account(s)");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            concat!(
+                "claude\n",
+                "  team             bob@example.com    error: unauthorized (HTTP 401 from api.anthropic.com); log in to this account again\n",
+                "  work             alice@example.com  5h 50% left (resets in 1m)\n",
+            )
+        );
+    }
+
+    #[test]
+    fn usage_asks_to_log_in_again_when_the_refresh_token_is_rejected() {
+        let (_home, ctx) = setup();
+        save_claude_profile(&ctx, "work", "alice", "a1", NOW - 10);
+        let http = FakeHttp::new(|_| Err(400));
+        let mut out = Vec::new();
+
+        usage(&ctx, &http, Some(Tool::Claude), None, NOW, &mut out).unwrap_err();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "claude\n  work             alice@example.com  error: token refresh failed (HTTP 400); log in to this account again and run `credhop save`\n"
+        );
+        assert_eq!(profile_token(&ctx, "work"), "a1");
+    }
+
+    #[test]
+    fn usage_adds_the_unsaved_live_account_unless_a_profile_is_named() {
+        let (_home, ctx) = setup();
+        login_claude(&ctx, "alice", "a1");
+        save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+        login_claude(&ctx, "carol", "c1");
+        let http = FakeHttp::new(|_| Ok(session_usage(0, 60)));
+
+        assert_eq!(
+            output(|out| usage(&ctx, &http, Some(Tool::Claude), None, NOW, out)),
+            concat!(
+                "claude\n",
+                "* (unsaved)        carol@example.com  5h 100% left (resets in 1m)\n",
+                "  work             alice@example.com  5h 100% left (resets in 1m)\n",
+            )
+        );
+        assert_eq!(
+            output(|out| usage(&ctx, &http, Some(Tool::Claude), Some("work"), NOW, out)),
+            "claude\n  work             alice@example.com  5h 100% left (resets in 1m)\n"
+        );
+    }
+
+    #[test]
+    fn usage_shows_accounts_without_subscription_limits() {
+        let (_home, ctx) = setup();
+        let api_key =
+            json!({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-test-abcd", "tokens": null});
+        ctx.store
+            .save_profile(Tool::Codex, "apikey", &api_key)
+            .unwrap();
+        let http = FakeHttp::new(|_| Err(500));
+
+        assert_eq!(
+            output(|out| usage(&ctx, &http, Some(Tool::Codex), None, NOW, out)),
+            "codex\n  apikey           API key (****abcd)  no subscription limits\n"
+        );
+        assert!(http.requests().is_empty());
+    }
+
+    #[test]
+    fn usage_of_an_unknown_profile_fails() {
+        let (_home, ctx) = setup();
+        let http = FakeHttp::new(|_| Err(500));
+
+        let err = usage(
+            &ctx,
+            &http,
+            Some(Tool::Claude),
+            Some("nope"),
+            NOW,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "profile 'claude/nope' not found");
     }
 }
