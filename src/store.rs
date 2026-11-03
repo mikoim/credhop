@@ -1,6 +1,5 @@
-//! Profile and state storage under the credhop data directory.
+//! Profile storage under the credhop data directory.
 
-use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::ErrorKind;
@@ -55,7 +54,7 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Saved profiles and the active-profile state.
+/// Saved profiles.
 pub struct Store {
     root: PathBuf,
 }
@@ -107,20 +106,6 @@ impl Store {
         Ok(names)
     }
 
-    pub fn active(&self, tool: Tool) -> Result<Option<String>> {
-        Ok(self.read_state()?.remove(tool.as_str()))
-    }
-
-    pub fn set_active(&self, tool: Tool, name: Option<&str>) -> Result<()> {
-        let mut state = self.read_state()?;
-        match name {
-            Some(name) => state.insert(tool.as_str().to_owned(), name.to_owned()),
-            None => state.remove(tool.as_str()),
-        };
-        create_private_dir(&self.root)?;
-        write_private_json(&self.state_path(), &serde_json::to_value(&state)?)
-    }
-
     /// Locks the store against other credhop processes until the returned
     /// file is dropped, waiting while another process holds the lock.
     pub fn lock(&self) -> Result<File> {
@@ -139,17 +124,6 @@ impl Store {
     fn profile_path(&self, tool: Tool, name: &str) -> Result<PathBuf> {
         validate_name(name)?;
         Ok(self.tool_dir(tool).join(format!("{name}.json")))
-    }
-
-    fn state_path(&self) -> PathBuf {
-        self.root.join("state.json")
-    }
-
-    fn read_state(&self) -> Result<BTreeMap<String, String>> {
-        match read_json(&self.state_path())? {
-            Some(value) => serde_json::from_value(value).context("invalid state.json"),
-            None => Ok(BTreeMap::new()),
-        }
     }
 }
 
@@ -275,24 +249,6 @@ mod tests {
         assert!(store.load_profile(Tool::Codex, "../x").is_err());
     }
 
-    #[test]
-    fn active_profile_round_trips() {
-        let dir = tempdir().unwrap();
-        let store = Store::new(dir.path().join("credhop"));
-
-        assert_eq!(store.active(Tool::Codex).unwrap(), None);
-        store.set_active(Tool::Codex, Some("personal")).unwrap();
-        store.set_active(Tool::Claude, Some("work")).unwrap();
-        assert_eq!(
-            store.active(Tool::Codex).unwrap().as_deref(),
-            Some("personal")
-        );
-
-        store.set_active(Tool::Codex, None).unwrap();
-        assert_eq!(store.active(Tool::Codex).unwrap(), None);
-        assert_eq!(store.active(Tool::Claude).unwrap().as_deref(), Some("work"));
-    }
-
     #[cfg(unix)]
     #[test]
     fn store_files_and_directories_are_private() {
@@ -303,11 +259,11 @@ mod tests {
         store
             .save_profile(Tool::Claude, "work", &json!({}))
             .unwrap();
-        store.set_active(Tool::Claude, Some("work")).unwrap();
+        drop(store.lock().unwrap());
 
         assert_eq!(mode(&root), 0o700);
         assert_eq!(mode(&root.join("profiles/claude")), 0o700);
         assert_eq!(mode(&root.join("profiles/claude/work.json")), 0o600);
-        assert_eq!(mode(&root.join("state.json")), 0o600);
+        assert_eq!(mode(&root.join("store.lock")), 0o600);
     }
 }

@@ -28,7 +28,7 @@ credhop save codex personal
 Switch, list and inspect:
 
 ```sh
-credhop list                 # list saved profiles (* = active)
+credhop list                 # list saved profiles (* = logged in)
 credhop use claude work      # switch Claude Code to "work"
 credhop use codex personal   # switch Codex to "personal"
 credhop status               # show the current account of each tool

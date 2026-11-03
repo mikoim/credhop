@@ -246,21 +246,20 @@ fn usage_error(e: anyhow::Error) -> anyhow::Error {
 pub fn list(ctx: &Ctx, out: &mut dyn Write) -> Result<()> {
     for tool in Tool::ALL {
         let provider = ctx.provider(tool);
-        let active = ctx.store.active(tool)?;
+        let live_id = provider
+            .read_live()?
+            .and_then(|live| provider.account_id(&live));
         writeln!(out, "{tool}")?;
         let names = ctx.store.list_profiles(tool)?;
         if names.is_empty() {
             writeln!(out, "  (no profiles)")?;
         }
         for name in names {
-            let marker = if active.as_deref() == Some(name.as_str()) {
-                '*'
-            } else {
-                ' '
-            };
-            let display = ctx
-                .store
-                .load_profile(tool, &name)?
+            let profile = ctx.store.load_profile(tool, &name)?;
+            let live = live_id.is_some()
+                && profile.as_ref().and_then(|p| provider.account_id(p)) == live_id;
+            let marker = if live { '*' } else { ' ' };
+            let display = profile
                 .and_then(|profile| provider.display(&profile))
                 .unwrap_or_default();
             let line = format!("{marker} {name:<16} {display}");
@@ -294,7 +293,6 @@ pub fn save(ctx: &Ctx, tool: Tool, name: &str, force: bool, out: &mut dyn Write)
         bail!("profile '{tool}/{name}' already exists; pass --force to overwrite");
     }
     ctx.store.save_profile(tool, name, &live)?;
-    ctx.store.set_active(tool, Some(name))?;
     writeln!(
         out,
         "Saved {tool} profile '{name}'{}",
@@ -326,7 +324,6 @@ pub fn use_profile(
         .load_profile(tool, name)?
         .with_context(|| format!("profile '{tool}/{name}' not found"))?;
     provider.write_live(&target)?;
-    ctx.store.set_active(tool, Some(name))?;
     // Claude Code rereads the files before each request; Codex keeps the
     // account it started with, also in the daemon that outlives its sessions.
     let apply = match tool {
@@ -355,7 +352,6 @@ pub fn logout(ctx: &Ctx, tool: Tool, force: bool, out: &mut dyn Write) -> Result
     }
     let owner = ctx.write_back_live(tool, provider.as_ref(), force, out)?;
     provider.clear_live()?;
-    ctx.store.set_active(tool, None)?;
     match owner {
         Some(owner) => writeln!(out, "Logged out of {tool}; credentials saved to '{owner}'")?,
         None => writeln!(out, "Logged out of {tool}")?,
@@ -376,9 +372,6 @@ pub fn remove(ctx: &Ctx, tool: Tool, name: &str, out: &mut dyn Write) -> Result<
     let _lock = ctx.store.lock()?;
     if !ctx.store.remove_profile(tool, name)? {
         bail!("profile '{tool}/{name}' not found");
-    }
-    if ctx.store.active(tool)?.as_deref() == Some(name) {
-        ctx.store.set_active(tool, None)?;
     }
     writeln!(out, "Removed {tool} profile '{name}'")?;
     Ok(())
@@ -589,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn save_stores_profile_and_marks_it_active() {
+    fn save_stores_profile() {
         let (_home, ctx) = setup();
         login_claude(&ctx, "alice", "a1");
 
@@ -597,10 +590,6 @@ mod tests {
 
         assert_eq!(out, "Saved claude profile 'work' (alice@example.com)\n");
         assert_eq!(profile_token(&ctx, "work"), "a1");
-        assert_eq!(
-            ctx.store.active(Tool::Claude).unwrap().as_deref(),
-            Some("work")
-        );
     }
 
     #[test]
@@ -703,10 +692,6 @@ mod tests {
         );
         assert_eq!(profile_token(&ctx, "personal"), "b2");
         assert_eq!(live_token(&ctx), "a1");
-        assert_eq!(
-            ctx.store.active(Tool::Claude).unwrap().as_deref(),
-            Some("work")
-        );
     }
 
     #[test]
@@ -863,7 +848,6 @@ mod tests {
         );
         assert_eq!(profile_token(&ctx, "work"), "a2");
         assert!(!ctx.home.join(".claude/.credentials.json").exists());
-        assert_eq!(ctx.store.active(Tool::Claude).unwrap(), None);
     }
 
     #[test]
@@ -919,7 +903,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_deletes_profile_and_clears_active() {
+    fn remove_deletes_profile() {
         let (_home, ctx) = setup();
         login_claude(&ctx, "alice", "a1");
         save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
@@ -932,7 +916,6 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(ctx.store.active(Tool::Claude).unwrap(), None);
         assert!(remove(&ctx, Tool::Claude, "work", &mut Vec::new()).is_err());
     }
 
@@ -951,22 +934,6 @@ mod tests {
                 .load_profile(Tool::Claude, "work")
                 .unwrap()
                 .is_none()
-        );
-    }
-
-    #[test]
-    fn remove_inactive_profile_keeps_active() {
-        let (_home, ctx) = setup();
-        login_claude(&ctx, "alice", "a1");
-        save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
-        login_claude(&ctx, "bob", "b1");
-        save(&ctx, Tool::Claude, "personal", false, &mut Vec::new()).unwrap();
-
-        remove(&ctx, Tool::Claude, "work", &mut Vec::new()).unwrap();
-
-        assert_eq!(
-            ctx.store.active(Tool::Claude).unwrap().as_deref(),
-            Some("personal")
         );
     }
 
@@ -991,6 +958,24 @@ mod tests {
         assert!(
             output(|out| status(&ctx, out)).starts_with("claude  (unsaved) (carol@example.com)\n")
         );
+    }
+
+    #[test]
+    fn list_marks_the_account_logged_in_to() {
+        let (_home, ctx) = setup();
+        login_claude(&ctx, "alice", "a1");
+        save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+        login_claude(&ctx, "bob", "b1");
+        save(&ctx, Tool::Claude, "personal", false, &mut Vec::new()).unwrap();
+        login_claude(&ctx, "alice", "a2"); // Logged in again without credhop.
+
+        assert_eq!(
+            output(|out| list(&ctx, out)),
+            "claude\n  personal         bob@example.com\n* work             alice@example.com\ncodex\n  (no profiles)\n",
+        );
+
+        login_claude(&ctx, "carol", "c1");
+        assert!(!output(|out| list(&ctx, out)).contains('*'));
     }
 
     use crate::http::fake::FakeHttp;
