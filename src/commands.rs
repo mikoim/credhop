@@ -271,6 +271,7 @@ pub fn list(ctx: &Ctx, out: &mut dyn Write) -> Result<()> {
 }
 
 pub fn save(ctx: &Ctx, tool: Tool, name: &str, force: bool, out: &mut dyn Write) -> Result<()> {
+    let _lock = ctx.store.lock()?;
     let exists = ctx.store.load_profile(tool, name)?.is_some();
     let provider = ctx.provider(tool);
     let _live_lock = provider.lock_live()?;
@@ -309,6 +310,7 @@ pub fn use_profile(
     force: bool,
     out: &mut dyn Write,
 ) -> Result<()> {
+    let _lock = ctx.store.lock()?;
     if ctx.store.load_profile(tool, name)?.is_none() {
         bail!("profile '{tool}/{name}' not found");
     }
@@ -344,6 +346,7 @@ pub fn use_profile(
 /// Logs out locally so the next login can add a new account without losing
 /// the rotated tokens of the current one.
 pub fn logout(ctx: &Ctx, tool: Tool, force: bool, out: &mut dyn Write) -> Result<()> {
+    let _lock = ctx.store.lock()?;
     let provider = ctx.provider(tool);
     let _live_lock = provider.lock_live()?;
     if provider.read_live()?.is_none() {
@@ -370,6 +373,7 @@ pub fn logout(ctx: &Ctx, tool: Tool, force: bool, out: &mut dyn Write) -> Result
 }
 
 pub fn remove(ctx: &Ctx, tool: Tool, name: &str, out: &mut dyn Write) -> Result<()> {
+    let _lock = ctx.store.lock()?;
     if !ctx.store.remove_profile(tool, name)? {
         bail!("profile '{tool}/{name}' not found");
     }
@@ -564,6 +568,20 @@ mod tests {
         });
     }
 
+    /// Runs `f` while another credhop process, such as `usage`, holds the
+    /// store lock and saves `token` of alice as the profile `name` before releasing it.
+    fn while_another_credhop_saves(ctx: &Ctx, name: &str, token: &str, f: impl FnOnce()) {
+        let lock = ctx.store.lock().unwrap();
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                thread::sleep(std::time::Duration::from_millis(300));
+                save_claude_profile(ctx, name, "alice", token, NOW);
+                drop(lock);
+            });
+            f();
+        });
+    }
+
     fn output(f: impl FnOnce(&mut Vec<u8>) -> Result<()>) -> String {
         let mut out = Vec::new();
         f(&mut out).unwrap();
@@ -606,6 +624,20 @@ mod tests {
 
         assert_eq!(err.to_string(), MISPAIRED);
         assert_eq!(profile_token(&ctx, "work"), "a1");
+    }
+
+    #[test]
+    fn save_waits_for_another_credhop() {
+        let (_home, ctx) = setup();
+        login_claude(&ctx, "alice", "a1");
+        save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+        login_claude(&ctx, "alice", "a2");
+
+        while_another_credhop_saves(&ctx, "work", "z", || {
+            save(&ctx, Tool::Claude, "work", true, &mut Vec::new()).unwrap();
+        });
+
+        assert_eq!(profile_token(&ctx, "work"), "a2");
     }
 
     #[test]
@@ -708,6 +740,21 @@ mod tests {
             "Switched codex to 'api' (API key (****abcd)). To apply, run \
              `codex app-server daemon stop` and restart running codex sessions.\n"
         );
+    }
+
+    #[test]
+    fn use_waits_for_another_credhop() {
+        let (_home, ctx) = setup();
+        login_claude(&ctx, "alice", "a1");
+        save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+        login_claude(&ctx, "bob", "b1");
+        save(&ctx, Tool::Claude, "personal", false, &mut Vec::new()).unwrap();
+
+        while_another_credhop_saves(&ctx, "work", "a2", || {
+            use_profile(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+        });
+
+        assert_eq!(live_token(&ctx), "a2");
     }
 
     #[test]
@@ -833,6 +880,20 @@ mod tests {
     }
 
     #[test]
+    fn logout_waits_for_another_credhop() {
+        let (_home, ctx) = setup();
+        login_claude(&ctx, "alice", "a1");
+        save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+        login_claude(&ctx, "alice", "a2");
+
+        while_another_credhop_saves(&ctx, "work", "z", || {
+            logout(&ctx, Tool::Claude, false, &mut Vec::new()).unwrap();
+        });
+
+        assert_eq!(profile_token(&ctx, "work"), "a2");
+    }
+
+    #[test]
     fn logout_refuses_to_discard_unsaved_account_without_force() {
         let (_home, ctx) = setup();
         login_claude(&ctx, "carol", "c1");
@@ -873,6 +934,24 @@ mod tests {
         );
         assert_eq!(ctx.store.active(Tool::Claude).unwrap(), None);
         assert!(remove(&ctx, Tool::Claude, "work", &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn remove_waits_for_another_credhop() {
+        let (_home, ctx) = setup();
+        login_claude(&ctx, "alice", "a1");
+        save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+
+        while_another_credhop_saves(&ctx, "work", "z", || {
+            remove(&ctx, Tool::Claude, "work", &mut Vec::new()).unwrap();
+        });
+
+        assert!(
+            ctx.store
+                .load_profile(Tool::Claude, "work")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

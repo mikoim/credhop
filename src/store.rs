@@ -125,7 +125,7 @@ impl Store {
     /// file is dropped, waiting while another process holds the lock.
     pub fn lock(&self) -> Result<File> {
         create_private_dir(&self.root)?;
-        let path = self.root.join("usage.lock");
+        let path = self.root.join("store.lock");
         let file = open_lock_file(&path)?;
         file.lock()
             .with_context(|| format!("failed to lock {}", path.display()))?;
@@ -206,7 +206,7 @@ mod tests {
         let store = Store::new(root.clone());
 
         let held = store.lock().unwrap();
-        let other = fs::File::open(root.join("usage.lock")).unwrap();
+        let other = fs::File::open(root.join("store.lock")).unwrap();
         assert!(matches!(
             other.try_lock(),
             Err(fs::TryLockError::WouldBlock)

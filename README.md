@@ -148,7 +148,6 @@ to; if they have expired, start the tool once.
   `~/.claude/.credentials.json` or `~/.codex/auth.json` becomes a regular file.
 - The endpoints `credhop usage` calls and the locks of the tools are
   undocumented and may change without notice.
-- Do not run `credhop usage` at the same time as `use`, `save` or `logout`.
 
 ## License
 
