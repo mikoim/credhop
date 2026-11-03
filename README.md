@@ -111,6 +111,19 @@ writes the current live credentials back to the profile of the same account,
 so saved profiles stay valid. If the live credentials belong to an account
 that is not saved, `use` stops; save it first or pass `--force` to discard it.
 
+The tools refresh tokens and write these files while they run, so `save`,
+`use` and `logout` take the same locks the tools take, waiting up to 10
+seconds for a tool to finish:
+
+| Tool | Locks |
+|---|---|
+| Claude Code | `~/.claude/.oauth_refresh.lock`, `~/.claude.lock` and `~/.claude.json.lock` (directories) |
+| Codex | `~/.codex/auth.lock` (taken by Codex 0.166 and later) |
+
+If the live tokens are those of one saved account but the account info next
+to them is another's, `save`, `use` and `logout` stop and say how to restore
+the profile.
+
 `credhop usage` asks the servers the tools use: `api.anthropic.com` and
 `platform.claude.com` for Claude Code, `chatgpt.com` and `auth.openai.com`
 for Codex. When the access token of a saved profile has expired, it
@@ -120,16 +133,21 @@ to; if they have expired, start the tool once.
 
 ## Caveats
 
-- Quit Claude Code and Codex before switching. Running sessions keep the old
-  credentials, and Claude Code may overwrite `~/.claude.json` while it runs.
-  On Windows, switching fails while a running tool has a credential file open.
+- Running Claude Code sessions switch accounts with their next request, in
+  the middle of a conversation. Quit them first if a conversation must stay
+  with the old account.
+- Codex keeps the account it started with. Its TUI also starts an app-server
+  daemon that keeps running after the TUI exits. After switching Codex, run
+  `codex app-server daemon stop` and restart running Codex sessions; the TUI
+  starts the daemon again.
+- On Windows, switching fails while a running tool has a credential file open.
 - `CLAUDE_CONFIG_DIR` and `CODEX_HOME` are not supported.
 - For Codex, only the default `cli_auth_credentials_store = "file"` is
   supported; credentials kept in the OS keyring are not found.
 - credhop replaces files atomically, so a symlinked `~/.claude.json`,
   `~/.claude/.credentials.json` or `~/.codex/auth.json` becomes a regular file.
-- The endpoints `credhop usage` calls are undocumented and may change
-  without notice.
+- The endpoints `credhop usage` calls and the locks of the tools are
+  undocumented and may change without notice.
 - Do not run `credhop usage` at the same time as `use`, `save` or `logout`.
 
 ## License

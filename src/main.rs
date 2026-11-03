@@ -6,6 +6,7 @@ mod commands;
 mod completion;
 mod fsutil;
 mod http;
+mod lock;
 mod provider;
 mod store;
 mod time;

@@ -10,6 +10,7 @@ use serde_json::Value;
 use crate::claude::Claude;
 use crate::codex::Codex;
 use crate::http::Http;
+use crate::lock::Locks;
 use crate::usage::Usage;
 
 /// Access tokens this close to expiring count as expired, so they cannot
@@ -53,8 +54,13 @@ pub trait Provider {
     fn write_live(&self, snapshot: &Value) -> Result<()>;
     /// Delete the live credentials so the tool asks to log in again.
     fn clear_live(&self) -> Result<()>;
+    /// Waits for, then holds until dropped, the locks the tool takes while it
+    /// refreshes or writes the live credentials.
+    fn lock_live(&self) -> Result<Locks>;
     /// Stable account identifier used to match live credentials to a profile.
     fn account_id(&self, snapshot: &Value) -> Option<String>;
+    /// The refresh token in `snapshot`, which no other account shares.
+    fn refresh_token<'a>(&self, snapshot: &'a Value) -> Option<&'a str>;
     /// Human-readable label for `status` and `list` (e.g. an email address).
     fn display(&self, snapshot: &Value) -> Option<String>;
     /// Whether the access token in `snapshot` expires within

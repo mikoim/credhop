@@ -1,6 +1,7 @@
 //! Claude Code provider (Linux and Windows: credentials live in files under the home directory).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -9,6 +10,7 @@ use crate::fsutil::{
     create_private_dir, read_json, remove_file_if_exists, replace_json, write_private_json,
 };
 use crate::http::{Http, host};
+use crate::lock::Locks;
 use crate::provider::{EXPIRY_MARGIN_SECS, Provider};
 use crate::time::parse_rfc3339;
 use crate::usage::{Usage, Window};
@@ -17,6 +19,10 @@ const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 /// Claude Code's OAuth client id.
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+/// When Claude Code treats the lock directories it holds while refreshing
+/// tokens, and while writing `~/.claude.json`, as left behind by a dead process.
+const REFRESH_LOCK_STALE: Duration = Duration::from_secs(60);
+const CONFIG_LOCK_STALE: Duration = Duration::from_secs(10);
 
 /// Claude Code stores OAuth tokens in `~/.claude/.credentials.json` and the
 /// account metadata in the `oauthAccount` key of `~/.claude.json`.
@@ -113,6 +119,19 @@ impl Provider for Claude {
         Ok(())
     }
 
+    fn lock_live(&self) -> Result<Locks> {
+        let mut locks = Locks::default();
+        // Taken in the order Claude Code takes them: the two refresh locks
+        // (`~/.claude.lock` is the older one), then the lock of `~/.claude.json`.
+        // Without its directory, Claude Code has never run, let alone refreshed.
+        if self.dir.is_dir() {
+            locks.add_dir(&self.dir.join(".oauth_refresh.lock"), REFRESH_LOCK_STALE)?;
+        }
+        locks.add_dir(&lock_path(&self.dir), REFRESH_LOCK_STALE)?;
+        locks.add_dir(&lock_path(&self.config_path), CONFIG_LOCK_STALE)?;
+        Ok(locks)
+    }
+
     fn account_id(&self, snapshot: &Value) -> Option<String> {
         let account = snapshot.get("oauthAccount")?;
         let user = account.get("accountUuid")?.as_str()?;
@@ -122,6 +141,12 @@ impl Provider for Claude {
                 None => user.to_owned(),
             },
         )
+    }
+
+    fn refresh_token<'a>(&self, snapshot: &'a Value) -> Option<&'a str> {
+        snapshot
+            .pointer("/credentials/claudeAiOauth/refreshToken")
+            .and_then(Value::as_str)
     }
 
     fn display(&self, snapshot: &Value) -> Option<String> {
@@ -197,6 +222,13 @@ impl Provider for Claude {
         let windows: Vec<Window> = limits.iter().filter_map(window).collect();
         Ok((!windows.is_empty()).then_some(Usage { windows }))
     }
+}
+
+/// `path` with `.lock` appended, where Claude Code locks it.
+fn lock_path(path: &Path) -> PathBuf {
+    let mut lock = path.as_os_str().to_owned();
+    lock.push(".lock");
+    PathBuf::from(lock)
 }
 
 /// An entry of `limits` in the usage response, if it is a 5-hour (`session`)
@@ -342,6 +374,39 @@ mod tests {
     }
 
     #[test]
+    fn lock_live_holds_the_locks_claude_code_takes() {
+        let home = tempdir().unwrap();
+        fs::create_dir(home.path().join(".claude")).unwrap();
+        let paths = [
+            ".claude/.oauth_refresh.lock",
+            ".claude.lock",
+            ".claude.json.lock",
+        ]
+        .map(|path| home.path().join(path));
+
+        let locks = Claude::new(home.path()).lock_live().unwrap();
+        for path in &paths {
+            assert!(path.is_dir(), "{}", path.display());
+        }
+
+        drop(locks);
+        for path in &paths {
+            assert!(!path.exists(), "{}", path.display());
+        }
+    }
+
+    #[test]
+    fn lock_live_works_before_claude_code_creates_its_directory() {
+        let home = tempdir().unwrap();
+
+        let locks = Claude::new(home.path()).lock_live().unwrap();
+
+        assert!(home.path().join(".claude.json.lock").is_dir());
+        assert!(!home.path().join(".claude").exists());
+        drop(locks);
+    }
+
+    #[test]
     fn clear_live_removes_credentials_and_oauth_account_only() {
         let home = tempdir().unwrap();
         let credentials = home.path().join(".claude/.credentials.json");
@@ -370,6 +435,17 @@ mod tests {
         Claude::new(home.path()).clear_live().unwrap();
 
         assert!(!home.path().join(".claude.json").exists());
+    }
+
+    #[test]
+    fn refresh_token_reads_the_oauth_credentials() {
+        let claude = Claude::new(Path::new("/unused"));
+        let mut live = snapshot("t", "alice");
+        assert_eq!(claude.refresh_token(&live), None);
+
+        live["credentials"]["claudeAiOauth"]["refreshToken"] = json!("r");
+
+        assert_eq!(claude.refresh_token(&live), Some("r"));
     }
 
     #[test]

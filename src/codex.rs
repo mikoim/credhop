@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use crate::fsutil::{create_private_dir, read_json, remove_file_if_exists, write_private_json};
 use crate::http::{Http, host};
+use crate::lock::Locks;
 use crate::provider::{EXPIRY_MARGIN_SECS, Provider};
 use crate::time::format_rfc3339;
 use crate::usage::{Usage, Window};
@@ -47,12 +48,25 @@ impl Provider for Codex {
         remove_file_if_exists(&self.auth_path())
     }
 
+    fn lock_live(&self) -> Result<Locks> {
+        let mut locks = Locks::default();
+        // Codex 0.166 and later hold it while they read, refresh and write auth.json.
+        if self.dir.is_dir() {
+            locks.add_file(&self.dir.join("auth.lock"))?;
+        }
+        Ok(locks)
+    }
+
     fn account_id(&self, snapshot: &Value) -> Option<String> {
         // `account_id` identifies the ChatGPT workspace; `sub` identifies the user in it.
         if let Some(workspace) = snapshot
             .pointer("/tokens/account_id")
             .and_then(Value::as_str)
         {
+            // Tokens issued for another workspace mix two accounts in one file.
+            if id_token_workspace(snapshot).is_some_and(|issued_for| issued_for != workspace) {
+                return None;
+            }
             let user = id_token_claim(snapshot, "sub");
             return Some(match user {
                 Some(user) => format!("{workspace}:{user}"),
@@ -60,6 +74,13 @@ impl Provider for Codex {
             });
         }
         api_key(snapshot).map(|key| format!("apikey:{}", last4(key)))
+    }
+
+    fn refresh_token<'a>(&self, snapshot: &'a Value) -> Option<&'a str> {
+        snapshot
+            .pointer("/tokens/refresh_token")
+            .and_then(Value::as_str)
+            .filter(|token| !token.is_empty())
     }
 
     fn display(&self, snapshot: &Value) -> Option<String> {
@@ -76,10 +97,8 @@ impl Provider for Codex {
     }
 
     fn refresh(&self, snapshot: &Value, http: &dyn Http, now: i64) -> Result<Value> {
-        let refresh_token = snapshot
-            .pointer("/tokens/refresh_token")
-            .and_then(Value::as_str)
-            .filter(|token| !token.is_empty())
+        let refresh_token = self
+            .refresh_token(snapshot)
             .context("no refresh token; log in to this account again")?;
         // RFC 6749 form encoding; without `scope`, the originally granted scope is kept.
         let response = http.post_form(
@@ -164,6 +183,13 @@ fn id_token_claim(snapshot: &Value, claim: &str) -> Option<String> {
     }
 }
 
+/// The workspace `tokens.id_token` was issued for.
+fn id_token_workspace(snapshot: &Value) -> Option<String> {
+    let token = snapshot.pointer("/tokens/id_token")?.as_str()?;
+    let auth = jwt_claim(token, "https://api.openai.com/auth")?;
+    auth.get("chatgpt_account_id")?.as_str().map(str::to_owned)
+}
+
 /// Reads a claim from the payload of a JWT.
 fn jwt_claim(token: &str, claim: &str) -> Option<Value> {
     let payload = token.split('.').nth(1)?;
@@ -238,6 +264,29 @@ mod tests {
     }
 
     #[test]
+    fn lock_live_holds_the_auth_lock_codex_takes() {
+        use std::fs::{File, TryLockError};
+        let home = tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".codex")).unwrap();
+
+        let locks = Codex::new(home.path()).lock_live().unwrap();
+        let other = File::open(home.path().join(".codex/auth.lock")).unwrap();
+        assert!(matches!(other.try_lock(), Err(TryLockError::WouldBlock)));
+
+        drop(locks);
+        other.try_lock().unwrap();
+    }
+
+    #[test]
+    fn lock_live_does_not_create_the_codex_directory() {
+        let home = tempdir().unwrap();
+
+        Codex::new(home.path()).lock_live().unwrap();
+
+        assert!(!home.path().join(".codex").exists());
+    }
+
+    #[test]
     fn clear_live_removes_auth_file() {
         let home = tempdir().unwrap();
         let codex = Codex::new(home.path());
@@ -247,6 +296,36 @@ mod tests {
         codex.clear_live().unwrap();
 
         assert!(codex.read_live().unwrap().is_none());
+    }
+
+    #[test]
+    fn refresh_token_reads_the_tokens() {
+        let codex = Codex::new(Path::new("/unused"));
+        let mut auth = chatgpt_auth();
+        assert_eq!(codex.refresh_token(&auth), Some("r"));
+        assert_eq!(codex.refresh_token(&api_key_auth()), None);
+
+        auth["tokens"]["refresh_token"] = json!("");
+
+        assert_eq!(codex.refresh_token(&auth), None);
+    }
+
+    #[test]
+    fn account_id_is_unknown_when_the_id_token_is_for_another_workspace() {
+        let codex = Codex::new(Path::new("/unused"));
+        let mut auth = chatgpt_auth();
+        let id_token = |workspace: &str| {
+            json!(jwt(json!({
+                "sub": "user-1",
+                "https://api.openai.com/auth": {"chatgpt_account_id": workspace},
+            })))
+        };
+
+        auth["tokens"]["id_token"] = id_token("ws-1");
+        assert_eq!(codex.account_id(&auth).as_deref(), Some("ws-1:user-1"));
+
+        auth["tokens"]["id_token"] = id_token("ws-2");
+        assert_eq!(codex.account_id(&auth), None);
     }
 
     #[test]

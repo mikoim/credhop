@@ -62,6 +62,30 @@ impl Ctx {
         Ok(None)
     }
 
+    /// Name of the saved profile holding the refresh token of `snapshot` for
+    /// another account: the tool paired the tokens with the wrong account, for
+    /// example by recording an account it fetched with replaced tokens.
+    fn mispaired_profile(
+        &self,
+        tool: Tool,
+        provider: &dyn Provider,
+        snapshot: &Value,
+    ) -> Result<Option<String>> {
+        let Some(token) = provider.refresh_token(snapshot) else {
+            return Ok(None);
+        };
+        let id = provider.account_id(snapshot);
+        for name in self.store.list_profiles(tool)? {
+            if let Some(profile) = self.store.load_profile(tool, &name)?
+                && provider.refresh_token(&profile) == Some(token)
+                && provider.account_id(&profile) != id
+            {
+                return Ok(Some(name));
+            }
+        }
+        Ok(None)
+    }
+
     /// Writes the live credentials back to the profile of the same account
     /// before they are replaced, since tokens rotate while a tool runs.
     /// Returns that profile's name, or None if nothing was saved.
@@ -75,6 +99,14 @@ impl Ctx {
         let Some(live) = provider.read_live()? else {
             return Ok(None);
         };
+        if let Some(name) = self.mispaired_profile(tool, provider, &live)? {
+            // Nothing is lost: the tokens are saved in that profile already.
+            if !force {
+                return Err(mispaired_error(tool, &name));
+            }
+            writeln!(out, "Discarding mismatched {tool} credentials (--force)")?;
+            return Ok(None);
+        }
         match self.find_owner(tool, provider, &live)? {
             Some(owner) => {
                 self.store.save_profile(tool, &owner, &live)?;
@@ -182,6 +214,13 @@ fn label(provider: &dyn Provider, snapshot: &Value) -> String {
         .unwrap_or_default()
 }
 
+fn mispaired_error(tool: Tool, name: &str) -> anyhow::Error {
+    anyhow!(
+        "the current {tool} tokens belong to '{name}' but are paired with another account; \
+         run `credhop use {tool} {name} --force` to restore '{name}'"
+    )
+}
+
 /// A rejected refresh token (HTTP 400 or 401) means logging in again.
 fn refresh_error(e: anyhow::Error, tool: Tool, name: &str) -> anyhow::Error {
     if let Some(&StatusError {
@@ -234,9 +273,13 @@ pub fn list(ctx: &Ctx, out: &mut dyn Write) -> Result<()> {
 pub fn save(ctx: &Ctx, tool: Tool, name: &str, force: bool, out: &mut dyn Write) -> Result<()> {
     let exists = ctx.store.load_profile(tool, name)?.is_some();
     let provider = ctx.provider(tool);
+    let _live_lock = provider.lock_live()?;
     let live = provider
         .read_live()?
         .with_context(|| format!("not logged in to {tool}"))?;
+    if let Some(owner) = ctx.mispaired_profile(tool, provider.as_ref(), &live)? {
+        return Err(mispaired_error(tool, &owner));
+    }
     if provider.account_id(&live).is_none() {
         bail!("cannot identify the current {tool} account; log in again and retry");
     }
@@ -270,6 +313,8 @@ pub fn use_profile(
         bail!("profile '{tool}/{name}' not found");
     }
     let provider = ctx.provider(tool);
+    // Held until the switch is done, so the tool cannot rotate the tokens in between.
+    let _live_lock = provider.lock_live()?;
 
     ctx.write_back_live(tool, provider.as_ref(), force, out)?;
 
@@ -280,9 +325,17 @@ pub fn use_profile(
         .with_context(|| format!("profile '{tool}/{name}' not found"))?;
     provider.write_live(&target)?;
     ctx.store.set_active(tool, Some(name))?;
+    // Claude Code rereads the files before each request; Codex keeps the
+    // account it started with, also in the daemon that outlives its sessions.
+    let apply = match tool {
+        Tool::Claude => "Running claude sessions switch to it on their next request.",
+        Tool::Codex => {
+            "To apply, run `codex app-server daemon stop` and restart running codex sessions."
+        }
+    };
     writeln!(
         out,
-        "Switched {tool} to '{name}'{}. Restart running {tool} sessions to apply.",
+        "Switched {tool} to '{name}'{}. {apply}",
         label(provider.as_ref(), &target)
     )?;
     Ok(())
@@ -292,6 +345,7 @@ pub fn use_profile(
 /// the rotated tokens of the current one.
 pub fn logout(ctx: &Ctx, tool: Tool, force: bool, out: &mut dyn Write) -> Result<()> {
     let provider = ctx.provider(tool);
+    let _live_lock = provider.lock_live()?;
     if provider.read_live()?.is_none() {
         writeln!(out, "Not logged in to {tool}")?;
         return Ok(());
@@ -440,7 +494,10 @@ mod tests {
     /// Simulates Claude Code being logged in as `user` with access token `token`.
     fn login_claude(ctx: &Ctx, user: &str, token: &str) {
         fs::create_dir_all(ctx.home.join(".claude")).unwrap();
-        let credentials = json!({"claudeAiOauth": {"accessToken": token}});
+        let credentials = json!({"claudeAiOauth": {
+            "accessToken": token,
+            "refreshToken": format!("refresh-{token}"),
+        }});
         fs::write(
             ctx.home.join(".claude/.credentials.json"),
             credentials.to_string(),
@@ -452,6 +509,28 @@ mod tests {
         });
         fs::write(ctx.home.join(".claude.json"), config.to_string()).unwrap();
     }
+
+    /// Pairs the live Claude tokens with the account of `user`, as Claude Code
+    /// does when it records the profile it fetched with tokens replaced since.
+    fn pair_live_claude_with(ctx: &Ctx, user: &str) {
+        let path = ctx.home.join(".claude.json");
+        let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        config["oauthAccount"] =
+            json!({"accountUuid": user, "emailAddress": format!("{user}@example.com")});
+        fs::write(path, config.to_string()).unwrap();
+    }
+
+    /// Logs in as alice and bob, saved as `work` and `personal`, then pairs bob's tokens with alice.
+    fn mispair_claude(ctx: &Ctx) {
+        login_claude(ctx, "alice", "a1");
+        save(ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+        login_claude(ctx, "bob", "b1");
+        save(ctx, Tool::Claude, "personal", false, &mut Vec::new()).unwrap();
+        pair_live_claude_with(ctx, "alice");
+    }
+
+    const MISPAIRED: &str = "the current claude tokens belong to 'personal' but are paired with \
+        another account; run `credhop use claude personal --force` to restore 'personal'";
 
     fn live_token(ctx: &Ctx) -> String {
         let bytes = fs::read(ctx.home.join(".claude/.credentials.json")).unwrap();
@@ -468,6 +547,21 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned()
+    }
+
+    /// Runs `f` while Claude Code refreshes the token of `user` to `token`: it
+    /// holds its refresh lock from before `f` starts until the new token is written.
+    fn while_claude_refreshes(ctx: &Ctx, user: &str, token: &str, f: impl FnOnce()) {
+        let lock = ctx.home.join(".claude/.oauth_refresh.lock");
+        fs::create_dir(&lock).unwrap();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(std::time::Duration::from_millis(300));
+                login_claude(ctx, user, token);
+                fs::remove_dir(&lock).unwrap();
+            });
+            f();
+        });
     }
 
     fn output(f: impl FnOnce(&mut Vec<u8>) -> Result<()>) -> String {
@@ -489,6 +583,29 @@ mod tests {
             ctx.store.active(Tool::Claude).unwrap().as_deref(),
             Some("work")
         );
+    }
+
+    #[test]
+    fn save_waits_for_claude_code_to_finish_refreshing() {
+        let (_home, ctx) = setup();
+        login_claude(&ctx, "alice", "a1");
+
+        while_claude_refreshes(&ctx, "alice", "a2", || {
+            save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+        });
+
+        assert_eq!(profile_token(&ctx, "work"), "a2");
+    }
+
+    #[test]
+    fn save_refuses_tokens_paired_with_another_account() {
+        let (_home, ctx) = setup();
+        mispair_claude(&ctx);
+
+        let err = save(&ctx, Tool::Claude, "work", true, &mut Vec::new()).unwrap_err();
+
+        assert_eq!(err.to_string(), MISPAIRED);
+        assert_eq!(profile_token(&ctx, "work"), "a1");
     }
 
     #[test]
@@ -547,12 +664,49 @@ mod tests {
 
         let out = output(|out| use_profile(&ctx, Tool::Claude, "work", false, out));
 
-        assert!(out.starts_with("Switched claude to 'work' (alice@example.com)"));
+        assert_eq!(
+            out,
+            "Switched claude to 'work' (alice@example.com). \
+             Running claude sessions switch to it on their next request.\n"
+        );
         assert_eq!(profile_token(&ctx, "personal"), "b2");
         assert_eq!(live_token(&ctx), "a1");
         assert_eq!(
             ctx.store.active(Tool::Claude).unwrap().as_deref(),
             Some("work")
+        );
+    }
+
+    #[test]
+    fn use_waits_for_claude_code_to_finish_refreshing() {
+        let (_home, ctx) = setup();
+        login_claude(&ctx, "alice", "a1");
+        save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+        login_claude(&ctx, "bob", "b1");
+        save(&ctx, Tool::Claude, "personal", false, &mut Vec::new()).unwrap();
+
+        while_claude_refreshes(&ctx, "bob", "b2", || {
+            use_profile(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+        });
+
+        assert_eq!(profile_token(&ctx, "personal"), "b2");
+        assert_eq!(live_token(&ctx), "a1");
+    }
+
+    #[test]
+    fn use_tells_to_restart_codex_and_its_daemon() {
+        let (_home, ctx) = setup();
+        fs::create_dir(ctx.home.join(".codex")).unwrap();
+        let auth = json!({"OPENAI_API_KEY": "sk-test-abcd"});
+        fs::write(ctx.home.join(".codex/auth.json"), auth.to_string()).unwrap();
+        save(&ctx, Tool::Codex, "api", false, &mut Vec::new()).unwrap();
+
+        let out = output(|out| use_profile(&ctx, Tool::Codex, "api", false, out));
+
+        assert_eq!(
+            out,
+            "Switched codex to 'api' (API key (****abcd)). To apply, run \
+             `codex app-server daemon stop` and restart running codex sessions.\n"
         );
     }
 
@@ -581,6 +735,36 @@ mod tests {
 
         use_profile(&ctx, Tool::Claude, "work", true, &mut Vec::new()).unwrap();
         assert_eq!(live_token(&ctx), "a1");
+    }
+
+    #[test]
+    fn use_refuses_tokens_paired_with_another_account() {
+        let (_home, ctx) = setup();
+        mispair_claude(&ctx);
+
+        let err = use_profile(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap_err();
+
+        assert_eq!(err.to_string(), MISPAIRED);
+        assert_eq!(profile_token(&ctx, "work"), "a1");
+        assert_eq!(live_token(&ctx), "b1");
+    }
+
+    #[test]
+    fn use_force_restores_tokens_paired_with_another_account() {
+        let (_home, ctx) = setup();
+        mispair_claude(&ctx);
+
+        let out = output(|out| use_profile(&ctx, Tool::Claude, "personal", true, out));
+
+        assert!(out.starts_with(
+            "Discarding mismatched claude credentials (--force)\n\
+             Switched claude to 'personal' (bob@example.com)"
+        ));
+        assert_eq!(profile_token(&ctx, "work"), "a1");
+        assert_eq!(live_token(&ctx), "b1");
+        assert!(
+            output(|out| status(&ctx, out)).starts_with("claude  personal (bob@example.com)\n")
+        );
     }
 
     #[test]
@@ -633,6 +817,19 @@ mod tests {
         assert_eq!(profile_token(&ctx, "work"), "a2");
         assert!(!ctx.home.join(".claude/.credentials.json").exists());
         assert_eq!(ctx.store.active(Tool::Claude).unwrap(), None);
+    }
+
+    #[test]
+    fn logout_waits_for_claude_code_to_finish_refreshing() {
+        let (_home, ctx) = setup();
+        login_claude(&ctx, "alice", "a1");
+        save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+
+        while_claude_refreshes(&ctx, "alice", "a2", || {
+            logout(&ctx, Tool::Claude, false, &mut Vec::new()).unwrap();
+        });
+
+        assert_eq!(profile_token(&ctx, "work"), "a2");
     }
 
     #[test]
