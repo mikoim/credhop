@@ -99,7 +99,7 @@ fn main() -> Result<()> {
     let mut out = std::io::stdout().lock();
 
     match cli.command {
-        Command::List => commands::list(&ctx, &mut out),
+        Command::List => commands::list(&ctx, unix_now()?, &mut out),
         Command::Save { tool, name, force } => commands::save(&ctx, tool, &name, force, &mut out),
         Command::Use { tool, name, force } => {
             commands::use_profile(&ctx, tool, &name, force, &mut out)

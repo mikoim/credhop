@@ -96,6 +96,11 @@ impl Provider for Codex {
             .is_some_and(|exp| exp <= now + EXPIRY_MARGIN_SECS)
     }
 
+    fn login_expires_at(&self, _snapshot: &Value) -> Option<i64> {
+        // auth.json does not record when the refresh token expires.
+        None
+    }
+
     fn refresh(&self, snapshot: &Value, http: &dyn Http, now: i64) -> Result<Value> {
         let refresh_token = self
             .refresh_token(snapshot)
@@ -412,6 +417,13 @@ mod tests {
         assert!(!codex.token_expired(&auth_expiring_at(NOW + 61), NOW));
         assert!(codex.token_expired(&auth_expiring_at(NOW + 60), NOW));
         assert!(!codex.token_expired(&chatgpt_auth(), NOW)); // "a" is not a JWT
+    }
+
+    #[test]
+    fn login_expires_at_is_unknown() {
+        let codex = Codex::new(Path::new("/unused"));
+
+        assert_eq!(codex.login_expires_at(&chatgpt_auth()), None);
     }
 
     #[test]

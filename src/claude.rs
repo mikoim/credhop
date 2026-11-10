@@ -163,6 +163,14 @@ impl Provider for Claude {
             .is_some_and(|expires_at_ms| expires_at_ms <= (now + EXPIRY_MARGIN_SECS) * 1000)
     }
 
+    fn login_expires_at(&self, snapshot: &Value) -> Option<i64> {
+        // Refreshing never extends it: each response repeats the same limit.
+        snapshot
+            .pointer("/credentials/claudeAiOauth/refreshTokenExpiresAt")
+            .and_then(Value::as_i64)
+            .map(|expires_at_ms| expires_at_ms / 1000)
+    }
+
     fn refresh(&self, snapshot: &Value, http: &dyn Http, now: i64) -> Result<Value> {
         let mut refreshed = snapshot.clone();
         let oauth = refreshed
@@ -587,6 +595,17 @@ mod tests {
         assert!(!claude.token_expired(&oauth_snapshot(NOW + 61), NOW));
         assert!(claude.token_expired(&oauth_snapshot(NOW + 60), NOW));
         assert!(!claude.token_expired(&snapshot("t", "alice"), NOW));
+    }
+
+    #[test]
+    fn login_expires_at_reads_the_refresh_token_expiry_in_milliseconds() {
+        let claude = Claude::new(Path::new("/unused"));
+
+        assert_eq!(
+            claude.login_expires_at(&oauth_snapshot(NOW)),
+            Some(1_800_000_000)
+        );
+        assert_eq!(claude.login_expires_at(&snapshot("t", "alice")), None);
     }
 
     #[test]

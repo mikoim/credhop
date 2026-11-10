@@ -66,6 +66,9 @@ pub trait Provider {
     /// Whether the access token in `snapshot` expires within
     /// [`EXPIRY_MARGIN_SECS`] of `now` (Unix seconds); false when unknown.
     fn token_expired(&self, snapshot: &Value, now: i64) -> bool;
+    /// When the login in `snapshot` reaches its time limit (Unix seconds),
+    /// after which refreshing no longer works; None when unknown.
+    fn login_expires_at(&self, snapshot: &Value) -> Option<i64>;
     /// Exchanges the refresh token for new tokens and returns the updated snapshot.
     fn refresh(&self, snapshot: &Value, http: &dyn Http, now: i64) -> Result<Value>;
     /// The subscription usage of the account; None when it has no subscription limits.

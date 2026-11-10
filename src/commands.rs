@@ -10,7 +10,7 @@ use serde_json::Value;
 use crate::http::{Http, StatusError};
 use crate::provider::{Provider, Tool, provider_for};
 use crate::store::Store;
-use crate::usage::{Usage, format_windows};
+use crate::usage::{Usage, format_duration, format_windows};
 
 /// Everything a command needs: the profile store and the home directory of the live credentials.
 pub struct Ctx {
@@ -182,6 +182,19 @@ impl Ctx {
         let refreshed;
         let mut snapshot = &row.snapshot;
         if provider.token_expired(snapshot, now) {
+            // Past its time limit, a login cannot be refreshed, by the tool either.
+            if let Some(expires_at) = provider.login_expires_at(snapshot)
+                && expires_at <= now
+            {
+                let expired = format_login(expires_at, now);
+                // The live credentials need no `save`: `use` writes them back.
+                let save = if row.live {
+                    String::new()
+                } else {
+                    format!(" and run `credhop save {} {} --force`", row.tool, row.name)
+                };
+                return Outcome::Failed(anyhow!("{expired}; log in to this account again{save}"));
+            }
             // The running tool may be refreshing the live credentials at the same time.
             if row.live {
                 return Outcome::Expired;
@@ -214,6 +227,16 @@ fn label(provider: &dyn Provider, snapshot: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// `login expires in 24d11h` or `login expired 2d1h ago`, for a login that
+/// reaches its time limit at `expires_at`.
+fn format_login(expires_at: i64, now: i64) -> String {
+    if expires_at > now {
+        format!("login expires in {}", format_duration(expires_at - now))
+    } else {
+        format!("login expired {} ago", format_duration(now - expires_at))
+    }
+}
+
 fn mispaired_error(tool: Tool, name: &str) -> anyhow::Error {
     anyhow!(
         "the current {tool} tokens belong to '{name}' but are paired with another account; \
@@ -243,26 +266,42 @@ fn usage_error(e: anyhow::Error) -> anyhow::Error {
     e
 }
 
-pub fn list(ctx: &Ctx, out: &mut dyn Write) -> Result<()> {
+pub fn list(ctx: &Ctx, now: i64, out: &mut dyn Write) -> Result<()> {
     for tool in Tool::ALL {
         let provider = ctx.provider(tool);
-        let live_id = provider
-            .read_live()?
-            .and_then(|live| provider.account_id(&live));
+        let live = provider.read_live()?;
+        let live_id = live.as_ref().and_then(|live| provider.account_id(live));
         writeln!(out, "{tool}")?;
         let names = ctx.store.list_profiles(tool)?;
         if names.is_empty() {
             writeln!(out, "  (no profiles)")?;
         }
+        let mut rows = Vec::new();
         for name in names {
             let profile = ctx.store.load_profile(tool, &name)?;
-            let live = live_id.is_some()
+            let is_live = live_id.is_some()
                 && profile.as_ref().and_then(|p| provider.account_id(p)) == live_id;
-            let marker = if live { '*' } else { ' ' };
+            // The live credentials hold the login of the account logged in to,
+            // which is newer after logging in again.
+            let snapshot = if is_live { &live } else { &profile };
+            let login = snapshot
+                .as_ref()
+                .and_then(|snapshot| provider.login_expires_at(snapshot))
+                .map(|expires_at| format_login(expires_at, now))
+                .unwrap_or_default();
             let display = profile
                 .and_then(|profile| provider.display(&profile))
                 .unwrap_or_default();
-            let line = format!("{marker} {name:<16} {display}");
+            rows.push((is_live, name, display, login));
+        }
+        let width = rows
+            .iter()
+            .map(|(_, _, display, _)| display.chars().count())
+            .max()
+            .unwrap_or(0);
+        for (is_live, name, display, login) in rows {
+            let marker = if is_live { '*' } else { ' ' };
+            let line = format!("{marker} {name:<16} {display:<width$}  {login}");
             writeln!(out, "{}", line.trim_end())?;
         }
     }
@@ -458,8 +497,18 @@ pub fn usage(
                     format!("error: {e:#}")
                 }
             };
+            // An error already says what to do about the account.
+            let login = match outcome {
+                Outcome::Failed(_) => None,
+                _ => ctx.provider(tool).login_expires_at(&row.snapshot),
+            }
+            .map(|expires_at| format_login(expires_at, now))
+            .unwrap_or_default();
             let marker = if row.live { '*' } else { ' ' };
-            let line = format!("{marker} {:<16} {display:<width$}  {detail}", row.name);
+            let line = format!(
+                "{marker} {:<16} {display:<width$}  {detail}  {login}",
+                row.name
+            );
             writeln!(out, "{}", line.trim_end())?;
         }
         if empty {
@@ -946,7 +995,7 @@ mod tests {
         save(&ctx, Tool::Claude, "personal", false, &mut Vec::new()).unwrap();
 
         assert_eq!(
-            output(|out| list(&ctx, out)),
+            output(|out| list(&ctx, NOW, out)),
             "claude\n* personal         bob@example.com\n  work             alice@example.com\ncodex\n  (no profiles)\n",
         );
         assert_eq!(
@@ -970,12 +1019,48 @@ mod tests {
         login_claude(&ctx, "alice", "a2"); // Logged in again without credhop.
 
         assert_eq!(
-            output(|out| list(&ctx, out)),
+            output(|out| list(&ctx, NOW, out)),
             "claude\n  personal         bob@example.com\n* work             alice@example.com\ncodex\n  (no profiles)\n",
         );
 
         login_claude(&ctx, "carol", "c1");
-        assert!(!output(|out| list(&ctx, out)).contains('*'));
+        assert!(!output(|out| list(&ctx, NOW, out)).contains('*'));
+    }
+
+    #[test]
+    fn list_shows_when_each_login_expires() {
+        let (_home, ctx) = setup();
+        save_claude_profile(&ctx, "work", "alice", "a1", NOW);
+        save_claude_profile(&ctx, "team", "bob", "b1", NOW);
+        save_claude_profile(&ctx, "old", "carol", "c1", NOW);
+        end_profile_login(&ctx, "work", NOW + 24 * 86_400 + 11 * 3600);
+        end_profile_login(&ctx, "old", NOW - 2 * 86_400 - 3600);
+
+        assert_eq!(
+            output(|out| list(&ctx, NOW, out)),
+            concat!(
+                "claude\n",
+                "  old              carol@example.com  login expired 2d1h ago\n",
+                "  team             bob@example.com\n",
+                "  work             alice@example.com  login expires in 24d11h\n",
+                "codex\n",
+                "  (no profiles)\n",
+            )
+        );
+    }
+
+    #[test]
+    fn list_reads_the_login_of_the_live_account_from_the_live_credentials() {
+        let (_home, ctx) = setup();
+        login_claude(&ctx, "alice", "a1");
+        save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+        end_profile_login(&ctx, "work", NOW - 10);
+        set_live_claude_time(&ctx, "refreshTokenExpiresAt", NOW + 3 * 86_400); // Logged in again.
+
+        assert_eq!(
+            output(|out| list(&ctx, NOW, out)),
+            "claude\n* work             alice@example.com  login expires in 3d0h\ncodex\n  (no profiles)\n"
+        );
     }
 
     use crate::http::fake::FakeHttp;
@@ -1001,10 +1086,24 @@ mod tests {
 
     /// Makes the live Claude access token expire at `expires_at`.
     fn expire_live_claude(ctx: &Ctx, expires_at: i64) {
+        set_live_claude_time(ctx, "expiresAt", expires_at);
+    }
+
+    /// Sets the time `field` of the live Claude credentials to `at`.
+    fn set_live_claude_time(ctx: &Ctx, field: &str, at: i64) {
         let path = ctx.home.join(".claude/.credentials.json");
         let mut credentials: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        credentials["claudeAiOauth"]["expiresAt"] = json!(expires_at * 1000);
+        credentials["claudeAiOauth"][field] = json!(at * 1000);
         fs::write(path, credentials.to_string()).unwrap();
+    }
+
+    /// Makes the login of the saved Claude profile `name` reach its time limit at `expires_at`.
+    fn end_profile_login(ctx: &Ctx, name: &str, expires_at: i64) {
+        let mut profile = ctx.store.load_profile(Tool::Claude, name).unwrap().unwrap();
+        profile["credentials"]["claudeAiOauth"]["refreshTokenExpiresAt"] = json!(expires_at * 1000);
+        ctx.store
+            .save_profile(Tool::Claude, name, &profile)
+            .unwrap();
     }
 
     /// A Claude usage response with one 5-hour window.
@@ -1201,6 +1300,65 @@ mod tests {
             output(|out| usage(&ctx, &http, Some(Tool::Claude), Some("work"), NOW, out)),
             "claude\n  work             alice@example.com  5h 100% left (resets in 1m)\n"
         );
+    }
+
+    #[test]
+    fn usage_shows_when_each_login_expires() {
+        let (_home, ctx) = setup();
+        save_claude_profile(&ctx, "work", "alice", "a1", NOW + 3600);
+        save_claude_profile(&ctx, "team", "bob", "b1", NOW + 3600);
+        save_claude_profile(&ctx, "old", "carol", "c1", NOW + 3600);
+        end_profile_login(&ctx, "work", NOW + 24 * 86_400 + 11 * 3600);
+        end_profile_login(&ctx, "old", NOW - 3600); // The access token outlives the login.
+        let http = FakeHttp::new(|_| Ok(session_usage(50, 60)));
+
+        assert_eq!(
+            output(|out| usage(&ctx, &http, Some(Tool::Claude), None, NOW, out)),
+            concat!(
+                "claude\n",
+                "  old              carol@example.com  5h 50% left (resets in 1m)  login expired 1h0m ago\n",
+                "  team             bob@example.com    5h 50% left (resets in 1m)\n",
+                "  work             alice@example.com  5h 50% left (resets in 1m)  login expires in 24d11h\n",
+            )
+        );
+    }
+
+    #[test]
+    fn usage_does_not_refresh_a_login_past_its_time_limit() {
+        let (_home, ctx) = setup();
+        save_claude_profile(&ctx, "work", "alice", "a1", NOW - 10);
+        end_profile_login(&ctx, "work", NOW - 2 * 86_400 - 3600);
+        let http = FakeHttp::new(|_| Err(500));
+        let mut out = Vec::new();
+
+        let err = usage(&ctx, &http, Some(Tool::Claude), None, NOW, &mut out).unwrap_err();
+
+        assert_eq!(err.to_string(), "could not get the usage of 1 account(s)");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "claude\n  work             alice@example.com  error: login expired 2d1h ago; log in to this account again and run `credhop save claude work --force`\n"
+        );
+        assert!(http.requests().is_empty());
+    }
+
+    #[test]
+    fn usage_asks_to_log_in_again_when_the_live_login_is_past_its_time_limit() {
+        let (_home, ctx) = setup();
+        login_claude(&ctx, "alice", "a1");
+        save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+        expire_live_claude(&ctx, NOW - 10);
+        set_live_claude_time(&ctx, "refreshTokenExpiresAt", NOW - 3600);
+        let http = FakeHttp::new(|_| Err(500));
+        let mut out = Vec::new();
+
+        let err = usage(&ctx, &http, Some(Tool::Claude), None, NOW, &mut out).unwrap_err();
+
+        assert_eq!(err.to_string(), "could not get the usage of 1 account(s)");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "claude\n* work             alice@example.com  error: login expired 1h0m ago; log in to this account again\n"
+        );
+        assert!(http.requests().is_empty());
     }
 
     #[test]

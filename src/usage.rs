@@ -42,7 +42,7 @@ fn format_window(window: &Window, now: i64) -> String {
 }
 
 /// `3d4h`, `2h13m`, `45m` or `<1m`.
-fn format_duration(seconds: i64) -> String {
+pub fn format_duration(seconds: i64) -> String {
     let minutes = seconds / 60;
     let (days, hours, minutes) = (minutes / 1440, minutes / 60 % 24, minutes % 60);
     if days > 0 {

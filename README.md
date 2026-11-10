@@ -48,13 +48,19 @@ credhop usage claude work    # one account
 
 ```text
 claude
-* work             alice@example.com  5h 77% left (resets in 2h13m)  7d 59% left (resets in 3d4h)
-  personal         bob@example.com    5h 100% left  7d 88% left (resets in 5d1h)
+* work             alice@example.com  5h 77% left (resets in 2h13m)  7d 59% left (resets in 3d4h)  login expires in 24d11h
+  personal         bob@example.com    5h 100% left  7d 88% left (resets in 5d1h)  login expires in 6d2h
 codex
 * personal         carol@example.com  5h 90% left (resets in 4h2m)  7d 45% left (resets in 1d20h)
 ```
 
 `*` marks the account you are logged in to.
+
+A Claude Code login has a time limit that refreshing the tokens does not
+extend. `list` and `usage` show how long each login has left. Once a login
+has expired, `usage` no longer asks the server about it: log in to the
+account again and run `credhop save claude <name> --force`. Codex does not
+record such a limit, so none is shown for it.
 
 To add another account, log out with credhop first. It writes the current
 tokens back to their profile, then deletes the live credentials so you can
