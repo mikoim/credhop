@@ -77,11 +77,14 @@ credhop save claude team
 
 ## Shell completion
 
-Commands, tools and saved profile names are completed in bash, fish and PowerShell.
+Commands, tools and saved profile names are completed in bash, zsh, fish and PowerShell.
 
 ```sh
 # bash: add to ~/.bashrc
 source <(credhop completions bash)
+
+# zsh: add to ~/.zshrc, after compinit
+source <(credhop completions zsh)
 
 # fish
 credhop completions fish > ~/.config/fish/completions/credhop.fish

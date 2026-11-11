@@ -195,7 +195,12 @@ mod tests {
                 shell: Shell::Powershell
             }
         ));
-        assert!(Cli::try_parse_from(["credhop", "completions", "zsh"]).is_err());
+        let cli = Cli::try_parse_from(["credhop", "completions", "zsh"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Completions { shell: Shell::Zsh }
+        ));
+        assert!(Cli::try_parse_from(["credhop", "completions", "elvish"]).is_err());
     }
 
     #[test]

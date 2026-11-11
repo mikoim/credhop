@@ -12,6 +12,8 @@ fn complete(shell: &str, home: &Path, words: &[&str]) -> Vec<String> {
         .arg("--")
         .args(words)
         .env("COMPLETE", shell)
+        // The zsh script passes the index of the word being completed.
+        .env("_CLAP_COMPLETE_INDEX", (words.len() - 1).to_string())
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
@@ -62,6 +64,22 @@ fn completes_the_profile_to_rename_but_not_its_new_name() {
         ["team", "work"]
     );
     assert!(complete("fish", &home, &["credhop", "rename", "claude", "work", ""]).is_empty());
+}
+
+#[test]
+fn completes_profile_names_for_the_zsh_script() {
+    let dir = tempdir().unwrap();
+    let home = common::unusual_home(dir.path());
+    common::save_profiles(&home, &[("claude", "work"), ("claude", "team")]);
+
+    assert_eq!(
+        complete("zsh", &home, &["credhop", "use", "claude", ""]),
+        ["team", "work"]
+    );
+    assert_eq!(
+        complete("zsh", &home, &["credhop", "use", "claude", "w"]),
+        ["work"]
+    );
 }
 
 #[test]
