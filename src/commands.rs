@@ -237,6 +237,15 @@ fn format_login(expires_at: i64, now: i64) -> String {
     }
 }
 
+/// How to log in to `tool`. Claude Code skips the login screen once
+/// onboarding is done, so it takes a command.
+fn login_step(tool: Tool) -> &'static str {
+    match tool {
+        Tool::Claude => "Start claude and run /login",
+        Tool::Codex => "Run `codex login`",
+    }
+}
+
 fn mispaired_error(tool: Tool, name: &str) -> anyhow::Error {
     anyhow!(
         "the current {tool} tokens belong to '{name}' but are paired with another account; \
@@ -345,6 +354,7 @@ pub fn use_profile(
     tool: Tool,
     name: &str,
     force: bool,
+    now: i64,
     out: &mut dyn Write,
 ) -> Result<()> {
     let _lock = ctx.store.lock()?;
@@ -376,6 +386,18 @@ pub fn use_profile(
         "Switched {tool} to '{name}'{}. {apply}",
         label(provider.as_ref(), &target)
     )?;
+    // Switched all the same: logging in again from here renews this profile,
+    // since the next switch writes the new login back to it.
+    if let Some(expires_at) = provider.login_expires_at(&target)
+        && expires_at <= now
+    {
+        writeln!(
+            out,
+            "Warning: {}. {} to log in again.",
+            format_login(expires_at, now),
+            login_step(tool)
+        )?;
+    }
     Ok(())
 }
 
@@ -395,14 +417,10 @@ pub fn logout(ctx: &Ctx, tool: Tool, force: bool, out: &mut dyn Write) -> Result
         Some(owner) => writeln!(out, "Logged out of {tool}; credentials saved to '{owner}'")?,
         None => writeln!(out, "Logged out of {tool}")?,
     }
-    // Claude Code skips the login screen once onboarding is done, so say how to log in.
-    let login = match tool {
-        Tool::Claude => "Start claude and run /login",
-        Tool::Codex => "Run `codex login`",
-    };
     writeln!(
         out,
-        "{login}, then run `credhop save {tool} <name>` to add a profile."
+        "{}, then run `credhop save {tool} <name>` to add a profile.",
+        login_step(tool)
     )?;
     Ok(())
 }
@@ -745,7 +763,7 @@ mod tests {
         save(&ctx, Tool::Claude, "personal", false, &mut Vec::new()).unwrap();
         login_claude(&ctx, "bob", "b2"); // Claude Code refreshed the token.
 
-        let out = output(|out| use_profile(&ctx, Tool::Claude, "work", false, out));
+        let out = output(|out| use_profile(&ctx, Tool::Claude, "work", false, NOW, out));
 
         assert_eq!(
             out,
@@ -765,7 +783,7 @@ mod tests {
         save(&ctx, Tool::Claude, "personal", false, &mut Vec::new()).unwrap();
 
         while_claude_refreshes(&ctx, "bob", "b2", || {
-            use_profile(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+            use_profile(&ctx, Tool::Claude, "work", false, NOW, &mut Vec::new()).unwrap();
         });
 
         assert_eq!(profile_token(&ctx, "personal"), "b2");
@@ -780,7 +798,7 @@ mod tests {
         fs::write(ctx.home.join(".codex/auth.json"), auth.to_string()).unwrap();
         save(&ctx, Tool::Codex, "api", false, &mut Vec::new()).unwrap();
 
-        let out = output(|out| use_profile(&ctx, Tool::Codex, "api", false, out));
+        let out = output(|out| use_profile(&ctx, Tool::Codex, "api", false, NOW, out));
 
         assert_eq!(
             out,
@@ -798,7 +816,7 @@ mod tests {
         save(&ctx, Tool::Claude, "personal", false, &mut Vec::new()).unwrap();
 
         while_another_credhop_saves(&ctx, "work", "a2", || {
-            use_profile(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+            use_profile(&ctx, Tool::Claude, "work", false, NOW, &mut Vec::new()).unwrap();
         });
 
         assert_eq!(live_token(&ctx), "a2");
@@ -811,7 +829,7 @@ mod tests {
         save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
         login_claude(&ctx, "alice", "a2");
 
-        use_profile(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+        use_profile(&ctx, Tool::Claude, "work", false, NOW, &mut Vec::new()).unwrap();
 
         assert_eq!(live_token(&ctx), "a2");
     }
@@ -823,11 +841,11 @@ mod tests {
         save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
         login_claude(&ctx, "carol", "c1");
 
-        let err = use_profile(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap_err();
+        let err = use_profile(&ctx, Tool::Claude, "work", false, NOW, &mut Vec::new()).unwrap_err();
         assert!(err.to_string().contains("not saved in any profile"));
         assert_eq!(live_token(&ctx), "c1");
 
-        use_profile(&ctx, Tool::Claude, "work", true, &mut Vec::new()).unwrap();
+        use_profile(&ctx, Tool::Claude, "work", true, NOW, &mut Vec::new()).unwrap();
         assert_eq!(live_token(&ctx), "a1");
     }
 
@@ -836,7 +854,7 @@ mod tests {
         let (_home, ctx) = setup();
         mispair_claude(&ctx);
 
-        let err = use_profile(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap_err();
+        let err = use_profile(&ctx, Tool::Claude, "work", false, NOW, &mut Vec::new()).unwrap_err();
 
         assert_eq!(err.to_string(), MISPAIRED);
         assert_eq!(profile_token(&ctx, "work"), "a1");
@@ -848,7 +866,7 @@ mod tests {
         let (_home, ctx) = setup();
         mispair_claude(&ctx);
 
-        let out = output(|out| use_profile(&ctx, Tool::Claude, "personal", true, out));
+        let out = output(|out| use_profile(&ctx, Tool::Claude, "personal", true, NOW, out));
 
         assert!(out.starts_with(
             "Discarding mismatched claude credentials (--force)\n\
@@ -868,7 +886,7 @@ mod tests {
         save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
         fs::remove_file(ctx.home.join(".claude/.credentials.json")).unwrap();
 
-        use_profile(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+        use_profile(&ctx, Tool::Claude, "work", false, NOW, &mut Vec::new()).unwrap();
 
         assert_eq!(live_token(&ctx), "a1");
     }
@@ -881,16 +899,49 @@ mod tests {
         login_claude(&ctx, "alice", "a2");
         fs::write(ctx.home.join(".claude.json"), "{}").unwrap();
 
-        let err = use_profile(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap_err();
+        let err = use_profile(&ctx, Tool::Claude, "work", false, NOW, &mut Vec::new()).unwrap_err();
 
         assert!(err.to_string().contains("not saved in any profile"));
         assert_eq!(live_token(&ctx), "a2");
     }
 
     #[test]
+    fn use_warns_when_the_login_of_the_profile_has_expired() {
+        let (_home, ctx) = setup();
+        save_claude_profile(&ctx, "work", "alice", "a1", NOW + 3600);
+        end_profile_login(&ctx, "work", NOW - 2 * 86_400 - 3600);
+
+        let out = output(|out| use_profile(&ctx, Tool::Claude, "work", false, NOW, out));
+
+        assert_eq!(
+            out,
+            concat!(
+                "Switched claude to 'work' (alice@example.com). ",
+                "Running claude sessions switch to it on their next request.\n",
+                "Warning: login expired 2d1h ago. Start claude and run /login to log in again.\n",
+            )
+        );
+        assert_eq!(live_token(&ctx), "a1"); // Switched all the same, to log in again from there.
+    }
+
+    #[test]
+    fn use_does_not_warn_before_the_login_expires() {
+        let (_home, ctx) = setup();
+        save_claude_profile(&ctx, "work", "alice", "a1", NOW + 3600);
+        end_profile_login(&ctx, "work", NOW + 60);
+
+        let out = output(|out| use_profile(&ctx, Tool::Claude, "work", false, NOW, out));
+
+        assert_eq!(
+            out,
+            "Switched claude to 'work' (alice@example.com). Running claude sessions switch to it on their next request.\n"
+        );
+    }
+
+    #[test]
     fn use_unknown_profile_fails() {
         let (_home, ctx) = setup();
-        let err = use_profile(&ctx, Tool::Claude, "nope", false, &mut Vec::new()).unwrap_err();
+        let err = use_profile(&ctx, Tool::Claude, "nope", false, NOW, &mut Vec::new()).unwrap_err();
         assert!(err.to_string().contains("profile 'claude/nope' not found"));
     }
 

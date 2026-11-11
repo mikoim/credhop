@@ -60,8 +60,10 @@ codex
 A Claude Code login has a time limit that refreshing the tokens does not
 extend. `list` and `usage` show how long each login has left. Once a login
 has expired, `usage` no longer asks the server about it: log in to the
-account again and run `credhop save claude <name> --force`. Codex does not
-record such a limit, so none is shown for it.
+account again and run `credhop save claude <name> --force`. `use` still
+switches to a profile whose login has expired, with a warning: log in again
+from there, and the next `use` or `logout` saves the new login to the
+profile. Codex does not record such a limit, so none is shown for it.
 
 To add another account, log out with credhop first. It writes the current
 tokens back to their profile, then deletes the live credentials so you can

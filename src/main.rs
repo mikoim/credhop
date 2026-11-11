@@ -110,7 +110,7 @@ fn main() -> Result<()> {
         Command::List => commands::list(&ctx, unix_now()?, &mut out),
         Command::Save { tool, name, force } => commands::save(&ctx, tool, &name, force, &mut out),
         Command::Use { tool, name, force } => {
-            commands::use_profile(&ctx, tool, &name, force, &mut out)
+            commands::use_profile(&ctx, tool, &name, force, unix_now()?, &mut out)
         }
         Command::Logout { tool, force } => commands::logout(&ctx, tool, force, &mut out),
         Command::Remove { tool, name } => commands::remove(&ctx, tool, &name, &mut out),
