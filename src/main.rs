@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{ArgValueCandidates, CompleteEnv};
 
-use crate::commands::Ctx;
+use crate::commands::{Ctx, Format};
 use crate::completion::Shell;
 use crate::http::Ureq;
 use crate::provider::Tool;
@@ -37,7 +37,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// List saved profiles
-    List,
+    List {
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
     /// Save the current credentials as a profile
     Save {
         #[arg(value_enum)]
@@ -81,13 +85,20 @@ enum Command {
         new: String,
     },
     /// Show the current account of each tool
-    Status,
+    Status {
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
     /// Show how much of the subscription usage limits is left for each account
     Usage {
         #[arg(value_enum)]
         tool: Option<Tool>,
         #[arg(add = ArgValueCandidates::new(completion::profile_names))]
         name: Option<String>,
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
     },
     /// Print the shell completion script
     Completions {
@@ -107,7 +118,7 @@ fn main() -> Result<()> {
     let mut out = std::io::stdout().lock();
 
     match cli.command {
-        Command::List => commands::list(&ctx, unix_now()?, &mut out),
+        Command::List { json } => commands::list(&ctx, unix_now()?, format(json), &mut out),
         Command::Save { tool, name, force } => commands::save(&ctx, tool, &name, force, &mut out),
         Command::Use { tool, name, force } => {
             commands::use_profile(&ctx, tool, &name, force, unix_now()?, &mut out)
@@ -115,17 +126,23 @@ fn main() -> Result<()> {
         Command::Logout { tool, force } => commands::logout(&ctx, tool, force, &mut out),
         Command::Remove { tool, name } => commands::remove(&ctx, tool, &name, &mut out),
         Command::Rename { tool, old, new } => commands::rename(&ctx, tool, &old, &new, &mut out),
-        Command::Status => commands::status(&ctx, &mut out),
-        Command::Usage { tool, name } => commands::usage(
+        Command::Status { json } => commands::status(&ctx, format(json), &mut out),
+        Command::Usage { tool, name, json } => commands::usage(
             &ctx,
             &Ureq::default(),
             tool,
             name.as_deref(),
             unix_now()?,
+            format(json),
             &mut out,
         ),
         Command::Completions { shell } => completion::write_registration(shell, &mut out),
     }
+}
+
+/// The output format `--json` selects.
+fn format(json: bool) -> Format {
+    if json { Format::Json } else { Format::Text }
 }
 
 /// The current time in Unix seconds.
@@ -163,7 +180,8 @@ mod tests {
             cli.command,
             Command::Usage {
                 tool: None,
-                name: None
+                name: None,
+                json: false
             }
         ));
         let cli = Cli::try_parse_from(["credhop", "usage", "claude"]).unwrap();
@@ -171,14 +189,35 @@ mod tests {
             cli.command,
             Command::Usage {
                 tool: Some(Tool::Claude),
-                name: None
+                name: None,
+                json: false
             }
         ));
         let cli = Cli::try_parse_from(["credhop", "usage", "codex", "work"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Usage { tool: Some(Tool::Codex), name: Some(ref name) } if name == "work"
+            Command::Usage { tool: Some(Tool::Codex), name: Some(ref name), json: false } if name == "work"
         ));
+    }
+
+    #[test]
+    fn parses_json_flag() {
+        let cli = Cli::try_parse_from(["credhop", "list", "--json"]).unwrap();
+        assert!(matches!(cli.command, Command::List { json: true }));
+        let cli = Cli::try_parse_from(["credhop", "list"]).unwrap();
+        assert!(matches!(cli.command, Command::List { json: false }));
+        let cli = Cli::try_parse_from(["credhop", "status", "--json"]).unwrap();
+        assert!(matches!(cli.command, Command::Status { json: true }));
+        let cli = Cli::try_parse_from(["credhop", "usage", "claude", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Usage {
+                tool: Some(Tool::Claude),
+                name: None,
+                json: true
+            }
+        ));
+        assert!(Cli::try_parse_from(["credhop", "save", "claude", "work", "--json"]).is_err());
     }
 
     #[test]

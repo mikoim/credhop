@@ -77,6 +77,48 @@ credhop save claude team
 
 `credhop logout` only deletes local files; it does not revoke the tokens.
 
+## JSON output
+
+For scripts, `list`, `status` and `usage` print JSON with `--json`: an array
+with one object per account.
+
+```sh
+credhop usage claude work --json
+```
+
+```json
+[
+  {
+    "tool": "claude",
+    "name": "work",
+    "account": "alice@example.com",
+    "live": true,
+    "windows": [
+      {
+        "label": "5h",
+        "used_percent": 23.0,
+        "resets_at": "2026-11-12T08:00:00Z"
+      }
+    ],
+    "login_expires_at": "2026-12-06T10:00:00Z",
+    "error": null
+  }
+]
+```
+
+| Command | Fields |
+|---|---|
+| `list` | `tool`, `name`, `account`, `live`, `login_expires_at` |
+| `status` | `tool`, `logged_in`, `profile`, `account` (one object per tool) |
+| `usage` | `tool`, `name`, `account`, `live`, `windows`, `login_expires_at`, `error` |
+
+Times are in UTC and unknown values are `null`. `live` is whether you are
+logged in to the account, and `name` or `profile` is `null` for an account
+that is not saved. In `usage`, `windows` is empty for an account without
+subscription limits, and `null` when the limits could not be read, with the
+reason in `error`. As without `--json`, `usage` exits with an error when it
+could not get the usage of an account.
+
 ## Shell completion
 
 Commands, tools and saved profile names are completed in bash, zsh, fish and PowerShell.

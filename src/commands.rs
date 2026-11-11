@@ -5,12 +5,16 @@ use std::path::PathBuf;
 use std::thread;
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::http::{Http, StatusError};
 use crate::provider::{Provider, Tool, provider_for};
 use crate::store::Store;
-use crate::usage::{Usage, format_duration, format_windows};
+use crate::time::format_rfc3339;
+use crate::usage::{Usage, Window, format_duration, format_windows};
+
+/// Shown in place of the profile name of an account that is not saved.
+const UNSAVED: &str = "(unsaved)";
 
 /// Everything a command needs: the profile store and the home directory of the live credentials.
 pub struct Ctx {
@@ -18,11 +22,40 @@ pub struct Ctx {
     pub home: PathBuf,
 }
 
+/// How `list`, `status` and `usage` print what they found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Format {
+    /// Lines for people.
+    Text,
+    /// A JSON array with one object per account, for scripts.
+    Json,
+}
+
+/// One saved profile `list` reports on.
+struct Listed {
+    tool: Tool,
+    name: String,
+    /// The label of the account, such as an email address.
+    account: Option<String>,
+    /// Whether the tool is logged in to this account.
+    live: bool,
+    login_expires_at: Option<i64>,
+}
+
+/// The account `status` reports for one tool.
+struct Current {
+    tool: Tool,
+    logged_in: bool,
+    /// The profile the account is saved in.
+    profile: Option<String>,
+    account: Option<String>,
+}
+
 /// One account `usage` reports on.
 struct Row {
     tool: Tool,
-    /// The profile name, or `(unsaved)`.
-    name: String,
+    /// The profile name; None for the live account when it is not saved.
+    name: Option<String>,
     /// The credentials to query with: the live ones for the live account.
     snapshot: Value,
     /// Whether `snapshot` holds the live credentials, which credhop never refreshes.
@@ -35,6 +68,13 @@ enum Outcome {
     NoLimits,
     Expired,
     Failed(anyhow::Error),
+}
+
+impl Row {
+    /// The profile name, or `(unsaved)`.
+    fn shown_name(&self) -> &str {
+        self.name.as_deref().unwrap_or(UNSAVED)
+    }
 }
 
 impl Ctx {
@@ -144,14 +184,14 @@ impl Ctx {
                 Some(live) if live_id.is_some() && provider.account_id(&profile) == live_id => {
                     Row {
                         tool,
-                        name: profile_name,
+                        name: Some(profile_name),
                         snapshot: live.clone(),
                         live: true,
                     }
                 }
                 _ => Row {
                     tool,
-                    name: profile_name,
+                    name: Some(profile_name),
                     snapshot: profile,
                     live: false,
                 },
@@ -166,7 +206,7 @@ impl Ctx {
                 0,
                 Row {
                     tool,
-                    name: "(unsaved)".to_owned(),
+                    name: None,
                     snapshot: live,
                     live: true,
                 },
@@ -191,7 +231,11 @@ impl Ctx {
                 let save = if row.live {
                     String::new()
                 } else {
-                    format!(" and run `credhop save {} {} --force`", row.tool, row.name)
+                    format!(
+                        " and run `credhop save {} {} --force`",
+                        row.tool,
+                        row.shown_name()
+                    )
                 };
                 return Outcome::Failed(anyhow!("{expired}; log in to this account again{save}"));
             }
@@ -201,10 +245,13 @@ impl Ctx {
             }
             refreshed = match provider.refresh(snapshot, http, now) {
                 Ok(refreshed) => refreshed,
-                Err(e) => return Outcome::Failed(refresh_error(e, row.tool, &row.name)),
+                Err(e) => return Outcome::Failed(refresh_error(e, row.tool, row.shown_name())),
             };
             // Save at once: the old refresh token no longer works.
-            if let Err(e) = self.store.save_profile(row.tool, &row.name, &refreshed) {
+            if let Err(e) = self
+                .store
+                .save_profile(row.tool, row.shown_name(), &refreshed)
+            {
                 return Outcome::Failed(anyhow!(
                     "tokens were refreshed but saving the profile failed: {e:#}; log in again"
                 ));
@@ -235,6 +282,31 @@ fn format_login(expires_at: i64, now: i64) -> String {
     } else {
         format!("login expired {} ago", format_duration(now - expires_at))
     }
+}
+
+/// `2026-12-06T10:00:00Z`, or null when the time is unknown.
+fn json_time(unix: Option<i64>) -> Value {
+    unix.map(format_rfc3339).into()
+}
+
+fn json_window(window: &Window) -> Value {
+    json!({
+        "label": window.label,
+        "used_percent": window.used_percent,
+        "resets_at": json_time(window.resets_at),
+    })
+}
+
+/// Prints `rows` as a JSON array.
+fn write_json(rows: Vec<Value>, out: &mut dyn Write) -> Result<()> {
+    serde_json::to_writer_pretty(&mut *out, &rows)?;
+    writeln!(out)?;
+    Ok(())
+}
+
+/// What `usage` shows for the live account while its access token is expired.
+fn expired_token(tool: Tool) -> String {
+    format!("access token expired; run {tool} to refresh it")
 }
 
 /// How to log in to `tool`. Claude Code skips the login screen once
@@ -275,42 +347,62 @@ fn usage_error(e: anyhow::Error) -> anyhow::Error {
     e
 }
 
-pub fn list(ctx: &Ctx, now: i64, out: &mut dyn Write) -> Result<()> {
+pub fn list(ctx: &Ctx, now: i64, format: Format, out: &mut dyn Write) -> Result<()> {
+    let mut rows = Vec::new();
     for tool in Tool::ALL {
         let provider = ctx.provider(tool);
         let live = provider.read_live()?;
         let live_id = live.as_ref().and_then(|live| provider.account_id(live));
-        writeln!(out, "{tool}")?;
-        let names = ctx.store.list_profiles(tool)?;
-        if names.is_empty() {
-            writeln!(out, "  (no profiles)")?;
-        }
-        let mut rows = Vec::new();
-        for name in names {
+        for name in ctx.store.list_profiles(tool)? {
             let profile = ctx.store.load_profile(tool, &name)?;
             let is_live = live_id.is_some()
                 && profile.as_ref().and_then(|p| provider.account_id(p)) == live_id;
             // The live credentials hold the login of the account logged in to,
             // which is newer after logging in again.
             let snapshot = if is_live { &live } else { &profile };
-            let login = snapshot
-                .as_ref()
-                .and_then(|snapshot| provider.login_expires_at(snapshot))
-                .map(|expires_at| format_login(expires_at, now))
-                .unwrap_or_default();
-            let display = profile
-                .and_then(|profile| provider.display(&profile))
-                .unwrap_or_default();
-            rows.push((is_live, name, display, login));
+            rows.push(Listed {
+                tool,
+                login_expires_at: snapshot
+                    .as_ref()
+                    .and_then(|snapshot| provider.login_expires_at(snapshot)),
+                account: profile.and_then(|profile| provider.display(&profile)),
+                live: is_live,
+                name,
+            });
+        }
+    }
+
+    if format == Format::Json {
+        let rows = rows.iter().map(|row| {
+            json!({
+                "tool": row.tool.as_str(),
+                "name": row.name,
+                "account": row.account,
+                "live": row.live,
+                "login_expires_at": json_time(row.login_expires_at),
+            })
+        });
+        return write_json(rows.collect(), out);
+    }
+    for tool in Tool::ALL {
+        writeln!(out, "{tool}")?;
+        let rows: Vec<&Listed> = rows.iter().filter(|row| row.tool == tool).collect();
+        if rows.is_empty() {
+            writeln!(out, "  (no profiles)")?;
         }
         let width = rows
             .iter()
-            .map(|(_, _, display, _)| display.chars().count())
+            .map(|row| row.account.as_deref().unwrap_or_default().chars().count())
             .max()
             .unwrap_or(0);
-        for (is_live, name, display, login) in rows {
-            let marker = if is_live { '*' } else { ' ' };
-            let line = format!("{marker} {name:<16} {display:<width$}  {login}");
+        for row in rows {
+            let marker = if row.live { '*' } else { ' ' };
+            let account = row.account.as_deref().unwrap_or_default();
+            let login = row
+                .login_expires_at
+                .map(|expires_at| format_login(expires_at, now))
+                .unwrap_or_default();
+            let line = format!("{marker} {:<16} {account:<width$}  {login}", row.name);
             writeln!(out, "{}", line.trim_end())?;
         }
     }
@@ -447,19 +539,46 @@ pub fn rename(ctx: &Ctx, tool: Tool, old: &str, new: &str, out: &mut dyn Write) 
     Ok(())
 }
 
-pub fn status(ctx: &Ctx, out: &mut dyn Write) -> Result<()> {
+pub fn status(ctx: &Ctx, format: Format, out: &mut dyn Write) -> Result<()> {
+    let mut rows = Vec::new();
     for tool in Tool::ALL {
         let provider = ctx.provider(tool);
-        let line = match provider.read_live()? {
-            None => "not logged in".to_owned(),
-            Some(live) => {
-                let profile = ctx
-                    .find_owner(tool, provider.as_ref(), &live)?
-                    .unwrap_or_else(|| "(unsaved)".to_owned());
-                format!("{profile}{}", label(provider.as_ref(), &live))
-            }
+        let live = provider.read_live()?;
+        let profile = match &live {
+            Some(live) => ctx.find_owner(tool, provider.as_ref(), live)?,
+            None => None,
         };
-        writeln!(out, "{tool:<7} {line}")?;
+        rows.push(Current {
+            tool,
+            logged_in: live.is_some(),
+            profile,
+            account: live.and_then(|live| provider.display(&live)),
+        });
+    }
+
+    if format == Format::Json {
+        let rows = rows.iter().map(|row| {
+            json!({
+                "tool": row.tool.as_str(),
+                "logged_in": row.logged_in,
+                "profile": row.profile,
+                "account": row.account,
+            })
+        });
+        return write_json(rows.collect(), out);
+    }
+    for row in rows {
+        let line = if row.logged_in {
+            let profile = row.profile.as_deref().unwrap_or(UNSAVED);
+            let account = row
+                .account
+                .map(|account| format!(" ({account})"))
+                .unwrap_or_default();
+            format!("{profile}{account}")
+        } else {
+            "not logged in".to_owned()
+        };
+        writeln!(out, "{:<7} {line}", row.tool)?;
     }
     Ok(())
 }
@@ -472,6 +591,7 @@ pub fn usage(
     tool: Option<Tool>,
     name: Option<&str>,
     now: i64,
+    format: Format,
     out: &mut dyn Write,
 ) -> Result<()> {
     // Refresh tokens work once: without the lock, two runs at the same time
@@ -497,53 +617,76 @@ pub fn usage(
             .collect()
     });
 
-    let displays: Vec<String> = rows
+    let failed = outcomes
         .iter()
-        .map(|row| {
-            ctx.provider(row.tool)
-                .display(&row.snapshot)
-                .unwrap_or_default()
-        })
+        .filter(|outcome| matches!(outcome, Outcome::Failed(_)))
+        .count();
+    let accounts: Vec<Option<String>> = rows
+        .iter()
+        .map(|row| ctx.provider(row.tool).display(&row.snapshot))
         .collect();
-    let width = displays
-        .iter()
-        .map(|display| display.chars().count())
-        .max()
-        .unwrap_or(0);
-    let mut failed = 0;
-    for &tool in tools {
-        writeln!(out, "{tool}")?;
-        let mut empty = true;
-        for ((row, outcome), display) in rows.iter().zip(&outcomes).zip(&displays) {
-            if row.tool != tool {
-                continue;
-            }
-            empty = false;
-            let detail = match outcome {
-                Outcome::Limits(usage) => format_windows(&usage.windows, now),
-                Outcome::NoLimits => "no subscription limits".to_owned(),
-                Outcome::Expired => format!("access token expired; run {tool} to refresh it"),
-                Outcome::Failed(e) => {
-                    failed += 1;
-                    format!("error: {e:#}")
-                }
+    let lines = rows.iter().zip(&outcomes).zip(&accounts);
+
+    if format == Format::Json {
+        let rows = lines.map(|((row, outcome), account)| {
+            let (windows, error) = match outcome {
+                Outcome::Limits(usage) => (Some(usage.windows.as_slice()), None),
+                Outcome::NoLimits => (Some(&[][..]), None),
+                Outcome::Expired => (None, Some(expired_token(row.tool))),
+                Outcome::Failed(e) => (None, Some(format!("{e:#}"))),
             };
-            // An error already says what to do about the account.
-            let login = match outcome {
-                Outcome::Failed(_) => None,
-                _ => ctx.provider(tool).login_expires_at(&row.snapshot),
+            let windows =
+                windows.map(|windows| windows.iter().map(json_window).collect::<Vec<_>>());
+            let login = ctx.provider(row.tool).login_expires_at(&row.snapshot);
+            json!({
+                "tool": row.tool.as_str(),
+                "name": row.name,
+                "account": account,
+                "live": row.live,
+                "windows": windows,
+                "login_expires_at": json_time(login),
+                "error": error,
+            })
+        });
+        write_json(rows.collect(), out)?;
+    } else {
+        let width = accounts
+            .iter()
+            .map(|account| account.as_deref().unwrap_or_default().chars().count())
+            .max()
+            .unwrap_or(0);
+        for &tool in tools {
+            writeln!(out, "{tool}")?;
+            let mut empty = true;
+            for ((row, outcome), account) in lines.clone() {
+                if row.tool != tool {
+                    continue;
+                }
+                empty = false;
+                let detail = match outcome {
+                    Outcome::Limits(usage) => format_windows(&usage.windows, now),
+                    Outcome::NoLimits => "no subscription limits".to_owned(),
+                    Outcome::Expired => expired_token(tool),
+                    Outcome::Failed(e) => format!("error: {e:#}"),
+                };
+                // An error already says what to do about the account.
+                let login = match outcome {
+                    Outcome::Failed(_) => None,
+                    _ => ctx.provider(tool).login_expires_at(&row.snapshot),
+                }
+                .map(|expires_at| format_login(expires_at, now))
+                .unwrap_or_default();
+                let marker = if row.live { '*' } else { ' ' };
+                let account = account.as_deref().unwrap_or_default();
+                let line = format!(
+                    "{marker} {:<16} {account:<width$}  {detail}  {login}",
+                    row.shown_name()
+                );
+                writeln!(out, "{}", line.trim_end())?;
             }
-            .map(|expires_at| format_login(expires_at, now))
-            .unwrap_or_default();
-            let marker = if row.live { '*' } else { ' ' };
-            let line = format!(
-                "{marker} {:<16} {display:<width$}  {detail}  {login}",
-                row.name
-            );
-            writeln!(out, "{}", line.trim_end())?;
-        }
-        if empty {
-            writeln!(out, "  (no profiles)")?;
+            if empty {
+                writeln!(out, "  (no profiles)")?;
+            }
         }
     }
     if failed > 0 {
@@ -875,7 +1018,8 @@ mod tests {
         assert_eq!(profile_token(&ctx, "work"), "a1");
         assert_eq!(live_token(&ctx), "b1");
         assert!(
-            output(|out| status(&ctx, out)).starts_with("claude  personal (bob@example.com)\n")
+            output(|out| status(&ctx, Format::Text, out))
+                .starts_with("claude  personal (bob@example.com)\n")
         );
     }
 
@@ -1110,17 +1254,18 @@ mod tests {
         save(&ctx, Tool::Claude, "personal", false, &mut Vec::new()).unwrap();
 
         assert_eq!(
-            output(|out| list(&ctx, NOW, out)),
+            output(|out| list(&ctx, NOW, Format::Text, out)),
             "claude\n* personal         bob@example.com\n  work             alice@example.com\ncodex\n  (no profiles)\n",
         );
         assert_eq!(
-            output(|out| status(&ctx, out)),
+            output(|out| status(&ctx, Format::Text, out)),
             "claude  personal (bob@example.com)\ncodex   not logged in\n",
         );
 
         login_claude(&ctx, "carol", "c1");
         assert!(
-            output(|out| status(&ctx, out)).starts_with("claude  (unsaved) (carol@example.com)\n")
+            output(|out| status(&ctx, Format::Text, out))
+                .starts_with("claude  (unsaved) (carol@example.com)\n")
         );
     }
 
@@ -1134,12 +1279,12 @@ mod tests {
         login_claude(&ctx, "alice", "a2"); // Logged in again without credhop.
 
         assert_eq!(
-            output(|out| list(&ctx, NOW, out)),
+            output(|out| list(&ctx, NOW, Format::Text, out)),
             "claude\n  personal         bob@example.com\n* work             alice@example.com\ncodex\n  (no profiles)\n",
         );
 
         login_claude(&ctx, "carol", "c1");
-        assert!(!output(|out| list(&ctx, NOW, out)).contains('*'));
+        assert!(!output(|out| list(&ctx, NOW, Format::Text, out)).contains('*'));
     }
 
     #[test]
@@ -1152,7 +1297,7 @@ mod tests {
         end_profile_login(&ctx, "old", NOW - 2 * 86_400 - 3600);
 
         assert_eq!(
-            output(|out| list(&ctx, NOW, out)),
+            output(|out| list(&ctx, NOW, Format::Text, out)),
             concat!(
                 "claude\n",
                 "  old              carol@example.com  login expired 2d1h ago\n",
@@ -1173,7 +1318,7 @@ mod tests {
         set_live_claude_time(&ctx, "refreshTokenExpiresAt", NOW + 3 * 86_400); // Logged in again.
 
         assert_eq!(
-            output(|out| list(&ctx, NOW, out)),
+            output(|out| list(&ctx, NOW, Format::Text, out)),
             "claude\n* work             alice@example.com  login expires in 3d0h\ncodex\n  (no profiles)\n"
         );
     }
@@ -1242,7 +1387,7 @@ mod tests {
             _ => Err(401),
         });
 
-        let out = output(|out| usage(&ctx, &http, None, None, NOW, out));
+        let out = output(|out| usage(&ctx, &http, None, None, NOW, Format::Text, out));
 
         assert_eq!(
             out,
@@ -1276,7 +1421,16 @@ mod tests {
         });
         let mut out = Vec::new();
 
-        let err = usage(&ctx, &http, Some(Tool::Claude), None, NOW, &mut out).unwrap_err();
+        let err = usage(
+            &ctx,
+            &http,
+            Some(Tool::Claude),
+            None,
+            NOW,
+            Format::Text,
+            &mut out,
+        )
+        .unwrap_err();
 
         assert_eq!(err.to_string(), "could not get the usage of 1 account(s)");
         assert_eq!(
@@ -1323,7 +1477,16 @@ mod tests {
         });
         let mut out = Vec::new();
 
-        let err = usage(&ctx, &http, Some(Tool::Claude), None, NOW, &mut out).unwrap_err();
+        let err = usage(
+            &ctx,
+            &http,
+            Some(Tool::Claude),
+            None,
+            NOW,
+            Format::Text,
+            &mut out,
+        )
+        .unwrap_err();
 
         assert_eq!(err.to_string(), "could not get the usage of 1 account(s)");
         let out = String::from_utf8(out).unwrap();
@@ -1346,7 +1509,17 @@ mod tests {
         expire_live_claude(&ctx, NOW - 10);
         let http = FakeHttp::new(|_| Err(500));
 
-        let out = output(|out| usage(&ctx, &http, Some(Tool::Claude), None, NOW, out));
+        let out = output(|out| {
+            usage(
+                &ctx,
+                &http,
+                Some(Tool::Claude),
+                None,
+                NOW,
+                Format::Text,
+                out,
+            )
+        });
 
         assert_eq!(
             out,
@@ -1366,7 +1539,16 @@ mod tests {
         });
         let mut out = Vec::new();
 
-        let err = usage(&ctx, &http, Some(Tool::Claude), None, NOW, &mut out).unwrap_err();
+        let err = usage(
+            &ctx,
+            &http,
+            Some(Tool::Claude),
+            None,
+            NOW,
+            Format::Text,
+            &mut out,
+        )
+        .unwrap_err();
 
         assert_eq!(err.to_string(), "could not get the usage of 1 account(s)");
         assert_eq!(
@@ -1386,7 +1568,16 @@ mod tests {
         let http = FakeHttp::new(|_| Err(400));
         let mut out = Vec::new();
 
-        usage(&ctx, &http, Some(Tool::Claude), None, NOW, &mut out).unwrap_err();
+        usage(
+            &ctx,
+            &http,
+            Some(Tool::Claude),
+            None,
+            NOW,
+            Format::Text,
+            &mut out,
+        )
+        .unwrap_err();
 
         assert_eq!(
             String::from_utf8(out).unwrap(),
@@ -1404,7 +1595,15 @@ mod tests {
         let http = FakeHttp::new(|_| Ok(session_usage(0, 60)));
 
         assert_eq!(
-            output(|out| usage(&ctx, &http, Some(Tool::Claude), None, NOW, out)),
+            output(|out| usage(
+                &ctx,
+                &http,
+                Some(Tool::Claude),
+                None,
+                NOW,
+                Format::Text,
+                out
+            )),
             concat!(
                 "claude\n",
                 "* (unsaved)        carol@example.com  5h 100% left (resets in 1m)\n",
@@ -1412,7 +1611,15 @@ mod tests {
             )
         );
         assert_eq!(
-            output(|out| usage(&ctx, &http, Some(Tool::Claude), Some("work"), NOW, out)),
+            output(|out| usage(
+                &ctx,
+                &http,
+                Some(Tool::Claude),
+                Some("work"),
+                NOW,
+                Format::Text,
+                out
+            )),
             "claude\n  work             alice@example.com  5h 100% left (resets in 1m)\n"
         );
     }
@@ -1428,7 +1635,15 @@ mod tests {
         let http = FakeHttp::new(|_| Ok(session_usage(50, 60)));
 
         assert_eq!(
-            output(|out| usage(&ctx, &http, Some(Tool::Claude), None, NOW, out)),
+            output(|out| usage(
+                &ctx,
+                &http,
+                Some(Tool::Claude),
+                None,
+                NOW,
+                Format::Text,
+                out
+            )),
             concat!(
                 "claude\n",
                 "  old              carol@example.com  5h 50% left (resets in 1m)  login expired 1h0m ago\n",
@@ -1446,7 +1661,16 @@ mod tests {
         let http = FakeHttp::new(|_| Err(500));
         let mut out = Vec::new();
 
-        let err = usage(&ctx, &http, Some(Tool::Claude), None, NOW, &mut out).unwrap_err();
+        let err = usage(
+            &ctx,
+            &http,
+            Some(Tool::Claude),
+            None,
+            NOW,
+            Format::Text,
+            &mut out,
+        )
+        .unwrap_err();
 
         assert_eq!(err.to_string(), "could not get the usage of 1 account(s)");
         assert_eq!(
@@ -1466,7 +1690,16 @@ mod tests {
         let http = FakeHttp::new(|_| Err(500));
         let mut out = Vec::new();
 
-        let err = usage(&ctx, &http, Some(Tool::Claude), None, NOW, &mut out).unwrap_err();
+        let err = usage(
+            &ctx,
+            &http,
+            Some(Tool::Claude),
+            None,
+            NOW,
+            Format::Text,
+            &mut out,
+        )
+        .unwrap_err();
 
         assert_eq!(err.to_string(), "could not get the usage of 1 account(s)");
         assert_eq!(
@@ -1487,10 +1720,189 @@ mod tests {
         let http = FakeHttp::new(|_| Err(500));
 
         assert_eq!(
-            output(|out| usage(&ctx, &http, Some(Tool::Codex), None, NOW, out)),
+            output(|out| usage(&ctx, &http, Some(Tool::Codex), None, NOW, Format::Text, out)),
             "codex\n  apikey           API key (****abcd)  no subscription limits\n"
         );
         assert!(http.requests().is_empty());
+    }
+
+    /// Parses what a command printed with `Format::Json`.
+    fn json_output(out: Vec<u8>) -> Value {
+        serde_json::from_slice(&out).unwrap()
+    }
+
+    #[test]
+    fn list_prints_each_profile_as_json() {
+        let (_home, ctx) = setup();
+        save_claude_profile(&ctx, "team", "bob", "b1", NOW);
+        login_claude(&ctx, "alice", "a1");
+        save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+        set_live_claude_time(&ctx, "refreshTokenExpiresAt", NOW + 86_400);
+        let mut out = Vec::new();
+
+        list(&ctx, NOW, Format::Json, &mut out).unwrap();
+
+        assert_eq!(
+            json_output(out),
+            json!([
+                {
+                    "tool": "claude",
+                    "name": "team",
+                    "account": "bob@example.com",
+                    "live": false,
+                    "login_expires_at": null,
+                },
+                {
+                    "tool": "claude",
+                    "name": "work",
+                    "account": "alice@example.com",
+                    "live": true,
+                    "login_expires_at": "2026-10-18T01:20:00Z",
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn list_prints_an_empty_json_array_without_profiles() {
+        let (_home, ctx) = setup();
+        let mut out = Vec::new();
+
+        list(&ctx, NOW, Format::Json, &mut out).unwrap();
+
+        assert_eq!(json_output(out), json!([]));
+    }
+
+    #[test]
+    fn status_prints_every_tool_as_json() {
+        let (_home, ctx) = setup();
+        login_claude(&ctx, "alice", "a1");
+        save(&ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+        let mut out = Vec::new();
+
+        status(&ctx, Format::Json, &mut out).unwrap();
+
+        assert_eq!(
+            json_output(out),
+            json!([
+                {
+                    "tool": "claude",
+                    "logged_in": true,
+                    "profile": "work",
+                    "account": "alice@example.com",
+                },
+                {"tool": "codex", "logged_in": false, "profile": null, "account": null},
+            ])
+        );
+    }
+
+    #[test]
+    fn status_json_names_no_profile_for_an_unsaved_account() {
+        let (_home, ctx) = setup();
+        login_claude(&ctx, "carol", "c1");
+        let mut out = Vec::new();
+
+        status(&ctx, Format::Json, &mut out).unwrap();
+
+        assert_eq!(
+            json_output(out)[0],
+            json!({
+                "tool": "claude",
+                "logged_in": true,
+                "profile": null,
+                "account": "carol@example.com",
+            })
+        );
+    }
+
+    #[test]
+    fn usage_prints_limits_failures_and_accounts_without_limits_as_json() {
+        let (_home, ctx) = setup();
+        save_claude_profile(&ctx, "work", "alice", "a1", NOW + 3600);
+        end_profile_login(&ctx, "work", NOW + 86_400);
+        save_claude_profile(&ctx, "team", "bob", "b1", NOW + 3600);
+        let api_key =
+            json!({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-test-abcd", "tokens": null});
+        ctx.store
+            .save_profile(Tool::Codex, "apikey", &api_key)
+            .unwrap();
+        let http = FakeHttp::new(|request| match request.header("Authorization") {
+            Some("Bearer a1") => Ok(session_usage(23, 7980)),
+            _ => Err(401),
+        });
+        let mut out = Vec::new();
+
+        let err = usage(&ctx, &http, None, None, NOW, Format::Json, &mut out).unwrap_err();
+
+        assert_eq!(err.to_string(), "could not get the usage of 1 account(s)");
+        assert_eq!(
+            json_output(out),
+            json!([
+                {
+                    "tool": "claude",
+                    "name": "team",
+                    "account": "bob@example.com",
+                    "live": false,
+                    "windows": null,
+                    "login_expires_at": null,
+                    "error": "unauthorized (HTTP 401 from api.anthropic.com); log in to this account again",
+                },
+                {
+                    "tool": "claude",
+                    "name": "work",
+                    "account": "alice@example.com",
+                    "live": false,
+                    "windows": [
+                        {"label": "5h", "used_percent": 23.0, "resets_at": "2026-10-17T03:33:00Z"},
+                    ],
+                    "login_expires_at": "2026-10-18T01:20:00Z",
+                    "error": null,
+                },
+                {
+                    "tool": "codex",
+                    "name": "apikey",
+                    "account": "API key (****abcd)",
+                    "live": false,
+                    "windows": [],
+                    "login_expires_at": null,
+                    "error": null,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn usage_json_names_no_profile_for_the_unsaved_account() {
+        let (_home, ctx) = setup();
+        login_claude(&ctx, "carol", "c1");
+        expire_live_claude(&ctx, NOW - 10);
+        let http = FakeHttp::new(|_| Err(500));
+        let mut out = Vec::new();
+
+        // Not a failure: the tool refreshes the token the next time it runs.
+        usage(
+            &ctx,
+            &http,
+            Some(Tool::Claude),
+            None,
+            NOW,
+            Format::Json,
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(
+            json_output(out),
+            json!([{
+                "tool": "claude",
+                "name": null,
+                "account": "carol@example.com",
+                "live": true,
+                "windows": null,
+                "login_expires_at": null,
+                "error": "access token expired; run claude to refresh it",
+            }])
+        );
     }
 
     #[test]
@@ -1504,6 +1916,7 @@ mod tests {
             Some(Tool::Claude),
             Some("nope"),
             NOW,
+            Format::Text,
             &mut Vec::new(),
         )
         .unwrap_err();
