@@ -416,6 +416,19 @@ pub fn remove(ctx: &Ctx, tool: Tool, name: &str, out: &mut dyn Write) -> Result<
     Ok(())
 }
 
+pub fn rename(ctx: &Ctx, tool: Tool, old: &str, new: &str, out: &mut dyn Write) -> Result<()> {
+    let _lock = ctx.store.lock()?;
+    if ctx.store.load_profile(tool, old)?.is_none() {
+        bail!("profile '{tool}/{old}' not found");
+    }
+    if ctx.store.load_profile(tool, new)?.is_some() {
+        bail!("profile '{tool}/{new}' already exists");
+    }
+    ctx.store.rename_profile(tool, old, new)?;
+    writeln!(out, "Renamed {tool} profile '{old}' to '{new}'")?;
+    Ok(())
+}
+
 pub fn status(ctx: &Ctx, out: &mut dyn Write) -> Result<()> {
     for tool in Tool::ALL {
         let provider = ctx.provider(tool);
@@ -984,6 +997,57 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn rename_moves_the_profile_to_the_new_name() {
+        let (_home, ctx) = setup();
+        save_claude_profile(&ctx, "work", "alice", "a1", NOW);
+
+        let out = output(|out| rename(&ctx, Tool::Claude, "work", "main", out));
+
+        assert_eq!(out, "Renamed claude profile 'work' to 'main'\n");
+        assert_eq!(ctx.store.list_profiles(Tool::Claude).unwrap(), ["main"]);
+        assert_eq!(profile_token(&ctx, "main"), "a1");
+    }
+
+    #[test]
+    fn rename_keeps_both_profiles_when_the_new_name_is_taken() {
+        let (_home, ctx) = setup();
+        save_claude_profile(&ctx, "work", "alice", "a1", NOW);
+        save_claude_profile(&ctx, "team", "bob", "b1", NOW);
+
+        let err = rename(&ctx, Tool::Claude, "work", "team", &mut Vec::new()).unwrap_err();
+
+        assert_eq!(err.to_string(), "profile 'claude/team' already exists");
+        assert_eq!(profile_token(&ctx, "work"), "a1");
+        assert_eq!(profile_token(&ctx, "team"), "b1");
+    }
+
+    #[test]
+    fn rename_fails_for_an_unknown_profile_or_an_invalid_name() {
+        let (_home, ctx) = setup();
+        save_claude_profile(&ctx, "work", "alice", "a1", NOW);
+
+        let err = rename(&ctx, Tool::Claude, "nope", "main", &mut Vec::new()).unwrap_err();
+        assert_eq!(err.to_string(), "profile 'claude/nope' not found");
+        // Profiles are per tool: the Claude one is not a Codex one.
+        assert!(rename(&ctx, Tool::Codex, "work", "main", &mut Vec::new()).is_err());
+        assert!(rename(&ctx, Tool::Claude, "work", "../x", &mut Vec::new()).is_err());
+        assert_eq!(ctx.store.list_profiles(Tool::Claude).unwrap(), ["work"]);
+    }
+
+    #[test]
+    fn rename_waits_for_another_credhop() {
+        let (_home, ctx) = setup();
+        save_claude_profile(&ctx, "work", "alice", "a1", NOW);
+
+        while_another_credhop_saves(&ctx, "work", "a2", || {
+            rename(&ctx, Tool::Claude, "work", "main", &mut Vec::new()).unwrap();
+        });
+
+        // The tokens the other process refreshed moved along.
+        assert_eq!(profile_token(&ctx, "main"), "a2");
     }
 
     #[test]

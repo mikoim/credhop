@@ -52,6 +52,19 @@ fn completes_profile_names_of_the_typed_tool() {
 }
 
 #[test]
+fn completes_the_profile_to_rename_but_not_its_new_name() {
+    let dir = tempdir().unwrap();
+    let home = common::unusual_home(dir.path());
+    common::save_profiles(&home, &[("claude", "work"), ("claude", "team")]);
+
+    assert_eq!(
+        complete("fish", &home, &["credhop", "rename", "claude", ""]),
+        ["team", "work"]
+    );
+    assert!(complete("fish", &home, &["credhop", "rename", "claude", "work", ""]).is_empty());
+}
+
+#[test]
 fn completes_profile_names_for_the_powershell_script() {
     let dir = tempdir().unwrap();
     let home = common::unusual_home(dir.path());

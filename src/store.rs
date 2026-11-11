@@ -84,6 +84,14 @@ impl Store {
         }
     }
 
+    /// Renames the profile `old`, replacing `new` if it exists.
+    pub fn rename_profile(&self, tool: Tool, old: &str, new: &str) -> Result<()> {
+        let from = self.profile_path(tool, old)?;
+        let to = self.profile_path(tool, new)?;
+        fs::rename(&from, &to)
+            .with_context(|| format!("failed to rename {} to {}", from.display(), to.display()))
+    }
+
     /// Profile names of `tool`, sorted.
     pub fn list_profiles(&self, tool: Tool) -> Result<Vec<String>> {
         let dir = self.tool_dir(tool);

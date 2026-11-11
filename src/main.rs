@@ -72,6 +72,14 @@ enum Command {
         #[arg(add = ArgValueCandidates::new(completion::profile_names))]
         name: String,
     },
+    /// Rename a saved profile
+    Rename {
+        #[arg(value_enum)]
+        tool: Tool,
+        #[arg(add = ArgValueCandidates::new(completion::profile_names))]
+        old: String,
+        new: String,
+    },
     /// Show the current account of each tool
     Status,
     /// Show how much of the subscription usage limits is left for each account
@@ -106,6 +114,7 @@ fn main() -> Result<()> {
         }
         Command::Logout { tool, force } => commands::logout(&ctx, tool, force, &mut out),
         Command::Remove { tool, name } => commands::remove(&ctx, tool, &name, &mut out),
+        Command::Rename { tool, old, new } => commands::rename(&ctx, tool, &old, &new, &mut out),
         Command::Status => commands::status(&ctx, &mut out),
         Command::Usage { tool, name } => commands::usage(
             &ctx,
@@ -187,5 +196,15 @@ mod tests {
             }
         ));
         assert!(Cli::try_parse_from(["credhop", "completions", "zsh"]).is_err());
+    }
+
+    #[test]
+    fn parses_rename_command() {
+        let cli = Cli::try_parse_from(["credhop", "rename", "claude", "work", "main"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Rename { tool: Tool::Claude, ref old, ref new } if old == "work" && new == "main"
+        ));
+        assert!(Cli::try_parse_from(["credhop", "rename", "claude", "work"]).is_err());
     }
 }

@@ -32,6 +32,7 @@ credhop list                 # list saved profiles (* = logged in)
 credhop use claude work      # switch Claude Code to "work"
 credhop use codex personal   # switch Codex to "personal"
 credhop status               # show the current account of each tool
+credhop rename claude work main
 credhop remove codex personal
 ```
 
