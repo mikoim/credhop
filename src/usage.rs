@@ -17,6 +17,20 @@ pub struct Usage {
     pub windows: Vec<Window>,
 }
 
+impl Usage {
+    /// The percentage left in the window with the least left, as it is shown;
+    /// 100 without windows.
+    pub fn least_left(&self) -> i64 {
+        self.windows.iter().map(left_percent).min().unwrap_or(100)
+    }
+}
+
+/// How much of the limit is left, as a whole percentage from 0 to 100.
+fn left_percent(window: &Window) -> i64 {
+    // The cast also turns a rounded -0.0 into 0.
+    (100.0 - window.used_percent).round().clamp(0.0, 100.0) as i64
+}
+
 /// `5h 77% left (resets in 2h13m)  7d 59% left`: the windows, two spaces apart.
 pub fn format_windows(windows: &[Window], now: i64) -> String {
     windows
@@ -27,9 +41,7 @@ pub fn format_windows(windows: &[Window], now: i64) -> String {
 }
 
 fn format_window(window: &Window, now: i64) -> String {
-    // The cast also turns a rounded -0.0 into 0.
-    let left = (100.0 - window.used_percent).round().clamp(0.0, 100.0) as i64;
-    let mut text = format!("{} {left}% left", window.label);
+    let mut text = format!("{} {}% left", window.label, left_percent(window));
     if let Some(resets_at) = window.resets_at
         && resets_at > now
     {
@@ -105,6 +117,18 @@ mod tests {
         assert_eq!(left(100.4), "5h 0% left");
         assert_eq!(left(130.0), "5h 0% left");
         assert_eq!(left(-5.0), "5h 100% left");
+    }
+
+    #[test]
+    fn least_left_is_the_percentage_shown_for_the_fullest_window() {
+        let usage = |used: &[f64]| Usage {
+            windows: used.iter().map(|&used| window("5h", used, None)).collect(),
+        };
+
+        assert_eq!(usage(&[23.4, 91.0, 50.0]).least_left(), 9);
+        assert_eq!(usage(&[89.6]).least_left(), 10); // as `10% left` is shown
+        assert_eq!(usage(&[130.0, 20.0]).least_left(), 0);
+        assert_eq!(usage(&[]).least_left(), 100);
     }
 
     #[test]

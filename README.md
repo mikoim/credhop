@@ -77,6 +77,43 @@ credhop save claude team
 
 `credhop logout` only deletes local files; it does not revoke the tokens.
 
+## Switching automatically
+
+`credhop auto` switches a tool to another profile when the account you are
+logged in to runs low:
+
+```sh
+credhop auto claude                  # check once
+credhop auto claude --threshold 20   # switch at 20% left or less (default 10)
+credhop auto claude --watch 5m       # keep checking every 5 minutes, until Ctrl-C
+```
+
+```text
+claude 'work' is low: 5h 8% left (resets in 2h13m)  7d 59% left (resets in 3d4h)
+'personal' has the most left: 5h 100% left  7d 88% left (resets in 5d1h)
+Switched claude to 'personal' (bob@example.com). Running claude sessions switch to it on their next request.
+```
+
+It switches when any usage limit of the current account has the threshold
+or less left. The target is the profile with the most left, comparing the
+limit of each profile that has the least left. When no other profile has
+more than the threshold left, it keeps the current account. Profiles whose
+usage cannot be read, whose login has expired or that have no subscription
+limits are skipped. The other profiles are only asked about once the current
+account is low.
+
+The current account must be saved as a profile. Without `--watch`, a check
+that cannot read the usage of the current account exits with an error.
+
+With `--watch`, the interval is a number and `s`, `m` or `h`, and at least
+`1m`. Each line starts with the time in UTC. A check that fails is reported
+and tried again after the interval. As with `usage`, the live credentials
+are never refreshed, so the check fails while their access token is expired
+and no tool is running to refresh it.
+
+Running Codex sessions keep the old account after a switch (see
+[Caveats](#caveats)), so `auto` suits Claude Code best.
+
 ## JSON output
 
 For scripts, `list`, `status` and `usage` print JSON with `--json`: an array

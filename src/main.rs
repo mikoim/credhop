@@ -12,7 +12,8 @@ mod store;
 mod time;
 mod usage;
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -100,6 +101,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Switch to the profile with the most usage left when the current one runs low
+    Auto {
+        #[arg(value_enum)]
+        tool: Tool,
+        /// Switch when a usage limit of the current account has this percentage or less left
+        #[arg(long, value_name = "PERCENT", default_value_t = 10, value_parser = clap::value_parser!(u8).range(..=100))]
+        threshold: u8,
+        /// Keep checking at this interval, such as 90s, 5m or 1h, instead of once
+        #[arg(long, value_name = "INTERVAL", value_parser = watch_interval)]
+        watch: Option<Duration>,
+    },
     /// Print the shell completion script
     Completions {
         #[arg(value_enum)]
@@ -136,6 +148,29 @@ fn main() -> Result<()> {
             format(json),
             &mut out,
         ),
+        Command::Auto {
+            tool,
+            threshold,
+            watch,
+        } => {
+            let http = Ureq::default();
+            let Some(interval) = watch else {
+                return commands::auto(&ctx, &http, tool, threshold, unix_now()?, &mut out);
+            };
+            let mut err = std::io::stderr();
+            loop {
+                commands::auto_step(
+                    &ctx,
+                    &http,
+                    tool,
+                    threshold,
+                    unix_now()?,
+                    &mut out,
+                    &mut err,
+                )?;
+                thread::sleep(interval);
+            }
+        }
         Command::Completions { shell } => completion::write_registration(shell, &mut out),
     }
 }
@@ -143,6 +178,32 @@ fn main() -> Result<()> {
 /// The output format `--json` selects.
 fn format(json: bool) -> Format {
     if json { Format::Json } else { Format::Text }
+}
+
+/// Parses the interval of `auto --watch`: a number and `s`, `m` or `h`.
+fn watch_interval(s: &str) -> Result<Duration, String> {
+    let seconds = s
+        .char_indices()
+        .next_back()
+        .and_then(|(at, unit)| {
+            let per_unit = match unit {
+                's' => 1,
+                'm' => 60,
+                'h' => 3600,
+                _ => return None,
+            };
+            let digits = &s[..at];
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            digits.parse::<u64>().ok()?.checked_mul(per_unit)
+        })
+        .ok_or("expected a number and a unit, such as 90s, 5m or 1h")?;
+    // The servers limit how often the usage may be asked for.
+    if seconds < 60 {
+        return Err("the interval must be at least 1m".to_owned());
+    }
+    Ok(Duration::from_secs(seconds))
 }
 
 /// The current time in Unix seconds.
@@ -198,6 +259,70 @@ mod tests {
             cli.command,
             Command::Usage { tool: Some(Tool::Codex), name: Some(ref name), json: false } if name == "work"
         ));
+    }
+
+    #[test]
+    fn parses_auto_command() {
+        let cli = Cli::try_parse_from(["credhop", "auto", "claude"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Auto {
+                tool: Tool::Claude,
+                threshold: 10,
+                watch: None
+            }
+        ));
+        let cli = Cli::try_parse_from([
+            "credhop",
+            "auto",
+            "codex",
+            "--threshold",
+            "25",
+            "--watch",
+            "5m",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Auto {
+                tool: Tool::Codex,
+                threshold: 25,
+                watch: Some(interval)
+            } if interval == Duration::from_secs(300)
+        ));
+        assert!(Cli::try_parse_from(["credhop", "auto"]).is_err());
+        assert!(Cli::try_parse_from(["credhop", "auto", "claude", "--threshold", "101"]).is_err());
+        assert!(Cli::try_parse_from(["credhop", "auto", "claude", "--watch"]).is_err());
+    }
+
+    #[test]
+    fn watch_intervals_take_a_unit_and_are_at_least_a_minute() {
+        assert_eq!(watch_interval("90s"), Ok(Duration::from_secs(90)));
+        assert_eq!(watch_interval("1m"), Ok(Duration::from_secs(60)));
+        assert_eq!(watch_interval("2h"), Ok(Duration::from_secs(7200)));
+        for input in [
+            "",
+            "5",
+            "m",
+            "5x",
+            "-5m",
+            "1.5h",
+            "5 m",
+            "99999999999999999999h",
+        ] {
+            assert_eq!(
+                watch_interval(input),
+                Err("expected a number and a unit, such as 90s, 5m or 1h".to_owned()),
+                "{input}"
+            );
+        }
+        for input in ["59s", "0m"] {
+            assert_eq!(
+                watch_interval(input),
+                Err("the interval must be at least 1m".to_owned()),
+                "{input}"
+            );
+        }
     }
 
     #[test]

@@ -264,6 +264,76 @@ impl Ctx {
             Err(e) => Outcome::Failed(usage_error(e)),
         }
     }
+
+    /// Queries the usage of every account in `rows` at the same time.
+    fn fetch_usages(&self, rows: &[Row], http: &dyn Http, now: i64) -> Vec<Outcome> {
+        thread::scope(|scope| {
+            let handles: Vec<_> = rows
+                .iter()
+                .map(|row| scope.spawn(move || self.fetch_usage(row, http, now)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })
+                .collect()
+        })
+    }
+
+    /// Switches `tool` to the profile `name`, while the caller holds the store lock.
+    fn switch(
+        &self,
+        tool: Tool,
+        name: &str,
+        force: bool,
+        now: i64,
+        out: &mut dyn Write,
+    ) -> Result<()> {
+        if self.store.load_profile(tool, name)?.is_none() {
+            bail!("profile '{tool}/{name}' not found");
+        }
+        let provider = self.provider(tool);
+        // Held until the switch is done, so the tool cannot rotate the tokens in between.
+        let _live_lock = provider.lock_live()?;
+
+        self.write_back_live(tool, provider.as_ref(), force, out)?;
+
+        // Load after the write-back, which may have updated this very profile.
+        let target = self
+            .store
+            .load_profile(tool, name)?
+            .with_context(|| format!("profile '{tool}/{name}' not found"))?;
+        provider.write_live(&target)?;
+        // Claude Code rereads the files before each request; Codex keeps the
+        // account it started with, also in the daemon that outlives its sessions.
+        let apply = match tool {
+            Tool::Claude => "Running claude sessions switch to it on their next request.",
+            Tool::Codex => {
+                "To apply, run `codex app-server daemon stop` and restart running codex sessions."
+            }
+        };
+        writeln!(
+            out,
+            "Switched {tool} to '{name}'{}. {apply}",
+            label(provider.as_ref(), &target)
+        )?;
+        // Switched all the same: logging in again from here renews this profile,
+        // since the next switch writes the new login back to it.
+        if let Some(expires_at) = provider.login_expires_at(&target)
+            && expires_at <= now
+        {
+            writeln!(
+                out,
+                "Warning: {}. {} to log in again.",
+                format_login(expires_at, now),
+                login_step(tool)
+            )?;
+        }
+        Ok(())
+    }
 }
 
 /// `" (alice@example.com)"`, or an empty string when there is no label.
@@ -450,47 +520,7 @@ pub fn use_profile(
     out: &mut dyn Write,
 ) -> Result<()> {
     let _lock = ctx.store.lock()?;
-    if ctx.store.load_profile(tool, name)?.is_none() {
-        bail!("profile '{tool}/{name}' not found");
-    }
-    let provider = ctx.provider(tool);
-    // Held until the switch is done, so the tool cannot rotate the tokens in between.
-    let _live_lock = provider.lock_live()?;
-
-    ctx.write_back_live(tool, provider.as_ref(), force, out)?;
-
-    // Load after the write-back, which may have updated this very profile.
-    let target = ctx
-        .store
-        .load_profile(tool, name)?
-        .with_context(|| format!("profile '{tool}/{name}' not found"))?;
-    provider.write_live(&target)?;
-    // Claude Code rereads the files before each request; Codex keeps the
-    // account it started with, also in the daemon that outlives its sessions.
-    let apply = match tool {
-        Tool::Claude => "Running claude sessions switch to it on their next request.",
-        Tool::Codex => {
-            "To apply, run `codex app-server daemon stop` and restart running codex sessions."
-        }
-    };
-    writeln!(
-        out,
-        "Switched {tool} to '{name}'{}. {apply}",
-        label(provider.as_ref(), &target)
-    )?;
-    // Switched all the same: logging in again from here renews this profile,
-    // since the next switch writes the new login back to it.
-    if let Some(expires_at) = provider.login_expires_at(&target)
-        && expires_at <= now
-    {
-        writeln!(
-            out,
-            "Warning: {}. {} to log in again.",
-            format_login(expires_at, now),
-            login_step(tool)
-        )?;
-    }
-    Ok(())
+    ctx.switch(tool, name, force, now, out)
 }
 
 /// Logs out locally so the next login can add a new account without losing
@@ -602,20 +632,7 @@ pub fn usage(
     for &tool in tools {
         rows.extend(ctx.usage_rows(tool, name)?);
     }
-    let outcomes: Vec<Outcome> = thread::scope(|scope| {
-        let handles: Vec<_> = rows
-            .iter()
-            .map(|row| scope.spawn(move || ctx.fetch_usage(row, http, now)))
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| {
-                handle
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-            })
-            .collect()
-    });
+    let outcomes = ctx.fetch_usages(&rows, http, now);
 
     let failed = outcomes
         .iter()
@@ -691,6 +708,115 @@ pub fn usage(
     }
     if failed > 0 {
         bail!("could not get the usage of {failed} account(s)");
+    }
+    Ok(())
+}
+
+/// Switches `tool` to the profile with the most usage left when a usage limit
+/// of the current account has `threshold` percent or less left.
+pub fn auto(
+    ctx: &Ctx,
+    http: &dyn Http,
+    tool: Tool,
+    threshold: u8,
+    now: i64,
+    out: &mut dyn Write,
+) -> Result<()> {
+    // Held from the check to the switch, so another credhop cannot switch in
+    // between, and for the reason `usage` holds it.
+    let _lock = ctx.store.lock()?;
+    let (mut current, others): (Vec<Row>, Vec<Row>) = ctx
+        .usage_rows(tool, None)?
+        .into_iter()
+        .partition(|row| row.live);
+    let current = current
+        .pop()
+        .with_context(|| format!("not logged in to {tool}"))?;
+    // `use` could not write its tokens back before switching away from it.
+    let Some(name) = &current.name else {
+        bail!(
+            "current {tool} credentials are not saved in any profile; \
+             run `credhop save {tool} <name>` first"
+        );
+    };
+    let threshold = i64::from(threshold);
+
+    let unknown = || format!("could not get the usage of '{name}'");
+    let usage = match ctx.fetch_usage(&current, http, now) {
+        Outcome::Limits(usage) => usage,
+        Outcome::NoLimits => {
+            writeln!(out, "Keeping {tool} '{name}': no subscription limits")?;
+            return Ok(());
+        }
+        Outcome::Expired => return Err(anyhow!(expired_token(tool)).context(unknown())),
+        Outcome::Failed(e) => return Err(e.context(unknown())),
+    };
+    let windows = format_windows(&usage.windows, now);
+    if usage.least_left() > threshold {
+        writeln!(out, "Keeping {tool} '{name}': {windows}")?;
+        return Ok(());
+    }
+    writeln!(out, "{tool} '{name}' is low: {windows}")?;
+
+    // Asked only now, to leave the other accounts alone while this one lasts.
+    let mut best: Option<(&Row, Usage)> = None;
+    for (row, outcome) in others.iter().zip(ctx.fetch_usages(&others, http, now)) {
+        let reason = match outcome {
+            Outcome::Limits(usage) => {
+                // The first of equals wins: the profiles are in name order.
+                if best
+                    .as_ref()
+                    .is_none_or(|(_, most)| usage.least_left() > most.least_left())
+                {
+                    best = Some((row, usage));
+                }
+                continue;
+            }
+            // Its use may be billed instead of limited.
+            Outcome::NoLimits => "no subscription limits".to_owned(),
+            Outcome::Expired => expired_token(tool),
+            Outcome::Failed(e) => format!("{e:#}"),
+        };
+        writeln!(out, "Skipping '{}': {reason}", row.shown_name())?;
+    }
+    match best {
+        Some((row, usage)) if usage.least_left() > threshold => {
+            let target = row.shown_name();
+            let windows = format_windows(&usage.windows, now);
+            writeln!(out, "'{target}' has the most left: {windows}")?;
+            ctx.switch(tool, target, false, now, out)
+        }
+        _ => {
+            writeln!(
+                out,
+                "No other {tool} profile has more than {threshold}% left; keeping '{name}'."
+            )?;
+            Ok(())
+        }
+    }
+}
+
+/// One check of `auto --watch`: [`auto`] with the time before each line. A
+/// failure is reported on `err` and does not end the watch.
+pub fn auto_step(
+    ctx: &Ctx,
+    http: &dyn Http,
+    tool: Tool,
+    threshold: u8,
+    now: i64,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<()> {
+    let time = format_rfc3339(now);
+    let mut lines = Vec::new();
+    let result = auto(ctx, http, tool, threshold, now, &mut lines);
+    for line in String::from_utf8_lossy(&lines).lines() {
+        writeln!(out, "{time} {line}")?;
+    }
+    // A watch is often redirected to a file, where nothing flushes each line.
+    out.flush()?;
+    if let Err(e) = result {
+        writeln!(err, "{time} error: {e:#}")?;
     }
     Ok(())
 }
@@ -1922,5 +2048,252 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.to_string(), "profile 'claude/nope' not found");
+    }
+
+    /// Logs in to Claude as alice, saved as `work`, next to the saved
+    /// profiles `personal` of bob and `team` of carol.
+    fn claude_accounts(ctx: &Ctx) {
+        save_claude_profile(ctx, "personal", "bob", "b1", NOW + 3600);
+        save_claude_profile(ctx, "team", "carol", "c1", NOW + 3600);
+        login_claude(ctx, "alice", "a1");
+        save(ctx, Tool::Claude, "work", false, &mut Vec::new()).unwrap();
+    }
+
+    /// Answers the usage request of each access token in `used` with a
+    /// 5-hour window used that much, and any other request with HTTP 500.
+    fn usage_by_token(used: &'static [(&'static str, u32)]) -> FakeHttp {
+        FakeHttp::new(move |request| {
+            let token = request
+                .header("Authorization")
+                .and_then(|value| value.strip_prefix("Bearer "));
+            used.iter()
+                .find(|(owner, _)| Some(*owner) == token)
+                .map(|&(_, percent)| session_usage(percent, 3600))
+                .ok_or(500)
+        })
+    }
+
+    const SWITCHED_TO_TEAM: &str = "Switched claude to 'team' (carol@example.com). \
+        Running claude sessions switch to it on their next request.\n";
+
+    #[test]
+    fn auto_keeps_an_account_above_the_threshold_without_asking_about_the_others() {
+        let (_home, ctx) = setup();
+        claude_accounts(&ctx);
+        let http = usage_by_token(&[("a1", 89)]);
+
+        let out = output(|out| auto(&ctx, &http, Tool::Claude, 10, NOW, out));
+
+        assert_eq!(out, "Keeping claude 'work': 5h 11% left (resets in 1h0m)\n");
+        assert_eq!(http.requests().len(), 1);
+        assert_eq!(live_token(&ctx), "a1");
+    }
+
+    #[test]
+    fn auto_switches_at_the_threshold_to_the_profile_with_the_most_left() {
+        let (_home, ctx) = setup();
+        claude_accounts(&ctx);
+        login_claude(&ctx, "alice", "a2"); // Claude Code refreshed the token.
+        let http = usage_by_token(&[("a2", 90), ("b1", 40), ("c1", 15)]);
+
+        let out = output(|out| auto(&ctx, &http, Tool::Claude, 10, NOW, out));
+
+        assert_eq!(
+            out,
+            format!(
+                "claude 'work' is low: 5h 10% left (resets in 1h0m)\n\
+                 'team' has the most left: 5h 85% left (resets in 1h0m)\n\
+                 {SWITCHED_TO_TEAM}"
+            )
+        );
+        assert_eq!(live_token(&ctx), "c1");
+        assert_eq!(profile_token(&ctx, "work"), "a2");
+    }
+
+    #[test]
+    fn auto_counts_the_window_with_the_least_left() {
+        let (_home, ctx) = setup();
+        claude_accounts(&ctx);
+        let limits = |session: u32, weekly: u32| {
+            json!({"limits": [
+                {"group": "session", "percent": session},
+                {"group": "weekly", "percent": weekly},
+            ]})
+        };
+        let http = FakeHttp::new(move |request| match request.header("Authorization") {
+            Some("Bearer a1") => Ok(limits(5, 95)),
+            Some("Bearer b1") => Ok(limits(0, 70)),
+            Some("Bearer c1") => Ok(limits(60, 50)),
+            _ => Err(500),
+        });
+
+        let out = output(|out| auto(&ctx, &http, Tool::Claude, 10, NOW, out));
+
+        assert_eq!(
+            out,
+            format!(
+                "claude 'work' is low: 5h 95% left  7d 5% left\n\
+                 'team' has the most left: 5h 40% left  7d 50% left\n\
+                 {SWITCHED_TO_TEAM}"
+            )
+        );
+    }
+
+    #[test]
+    fn auto_prefers_the_first_profile_by_name_on_a_tie() {
+        let (_home, ctx) = setup();
+        claude_accounts(&ctx);
+        let http = usage_by_token(&[("a1", 100), ("b1", 30), ("c1", 30)]);
+
+        auto(&ctx, &http, Tool::Claude, 10, NOW, &mut Vec::new()).unwrap();
+
+        assert_eq!(live_token(&ctx), "b1");
+    }
+
+    #[test]
+    fn auto_keeps_the_account_when_no_profile_has_more_than_the_threshold() {
+        let (_home, ctx) = setup();
+        claude_accounts(&ctx);
+        let http = usage_by_token(&[("a1", 95), ("b1", 99), ("c1", 80)]);
+
+        let out = output(|out| auto(&ctx, &http, Tool::Claude, 20, NOW, out));
+
+        assert_eq!(
+            out,
+            "claude 'work' is low: 5h 5% left (resets in 1h0m)\n\
+             No other claude profile has more than 20% left; keeping 'work'.\n"
+        );
+        assert_eq!(live_token(&ctx), "a1");
+    }
+
+    #[test]
+    fn auto_skips_profiles_without_known_limits() {
+        let (_home, ctx) = setup();
+        claude_accounts(&ctx);
+        save_claude_profile(&ctx, "expired", "dave", "d1", NOW - 10);
+        end_profile_login(&ctx, "expired", NOW - 3600);
+        save_claude_profile(&ctx, "unlimited", "erin", "e1", NOW + 3600);
+        let http = FakeHttp::new(|request| match request.header("Authorization") {
+            Some("Bearer a1") => Ok(session_usage(100, 3600)),
+            Some("Bearer c1") => Ok(session_usage(70, 3600)),
+            Some("Bearer e1") => Ok(json!({"limits": []})),
+            _ => Err(500),
+        });
+
+        let out = output(|out| auto(&ctx, &http, Tool::Claude, 10, NOW, out));
+
+        assert_eq!(
+            out,
+            format!(
+                "claude 'work' is low: 5h 0% left (resets in 1h0m)\n\
+                 Skipping 'expired': login expired 1h0m ago; log in to this account again \
+                 and run `credhop save claude expired --force`\n\
+                 Skipping 'personal': HTTP 500 from api.anthropic.com\n\
+                 Skipping 'unlimited': no subscription limits\n\
+                 'team' has the most left: 5h 30% left (resets in 1h0m)\n\
+                 {SWITCHED_TO_TEAM}"
+            )
+        );
+        assert_eq!(live_token(&ctx), "c1");
+    }
+
+    #[test]
+    fn auto_keeps_an_account_without_subscription_limits() {
+        let (_home, ctx) = setup();
+        claude_accounts(&ctx);
+        let http = FakeHttp::new(|_| Ok(json!({"limits": []})));
+
+        let out = output(|out| auto(&ctx, &http, Tool::Claude, 10, NOW, out));
+
+        assert_eq!(out, "Keeping claude 'work': no subscription limits\n");
+        assert_eq!(http.requests().len(), 1);
+    }
+
+    #[test]
+    fn auto_fails_when_not_logged_in() {
+        let (_home, ctx) = setup();
+        save_claude_profile(&ctx, "work", "alice", "a1", NOW + 3600);
+        let http = FakeHttp::new(|_| Err(500));
+
+        let err = auto(&ctx, &http, Tool::Claude, 10, NOW, &mut Vec::new()).unwrap_err();
+
+        assert_eq!(err.to_string(), "not logged in to claude");
+        assert!(http.requests().is_empty());
+    }
+
+    #[test]
+    fn auto_fails_when_the_current_account_is_not_saved() {
+        let (_home, ctx) = setup();
+        save_claude_profile(&ctx, "work", "alice", "a1", NOW + 3600);
+        login_claude(&ctx, "carol", "c1");
+        let http = FakeHttp::new(|_| Err(500));
+
+        let err = auto(&ctx, &http, Tool::Claude, 10, NOW, &mut Vec::new()).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "current claude credentials are not saved in any profile; \
+             run `credhop save claude <name>` first"
+        );
+        assert!(http.requests().is_empty());
+        assert_eq!(live_token(&ctx), "c1");
+    }
+
+    #[test]
+    fn auto_fails_when_the_usage_of_the_current_account_is_unknown() {
+        let (_home, ctx) = setup();
+        claude_accounts(&ctx);
+        let http = usage_by_token(&[("b1", 0), ("c1", 0)]);
+
+        let err = auto(&ctx, &http, Tool::Claude, 10, NOW, &mut Vec::new()).unwrap_err();
+
+        assert_eq!(
+            format!("{err:#}"),
+            "could not get the usage of 'work': HTTP 500 from api.anthropic.com"
+        );
+        assert_eq!(live_token(&ctx), "a1");
+
+        expire_live_claude(&ctx, NOW - 10);
+        let err = auto(&ctx, &http, Tool::Claude, 10, NOW, &mut Vec::new()).unwrap_err();
+
+        assert_eq!(
+            format!("{err:#}"),
+            "could not get the usage of 'work': access token expired; run claude to refresh it"
+        );
+        assert_eq!(http.requests().len(), 1); // the live credentials are never refreshed
+    }
+
+    #[test]
+    fn auto_step_starts_each_line_with_the_time() {
+        let (_home, ctx) = setup();
+        claude_accounts(&ctx);
+        let http = usage_by_token(&[("a1", 95), ("b1", 99), ("c1", 99)]);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+
+        auto_step(&ctx, &http, Tool::Claude, 10, NOW, &mut out, &mut err).unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "2026-10-17T01:20:00Z claude 'work' is low: 5h 5% left (resets in 1h0m)\n\
+             2026-10-17T01:20:00Z No other claude profile has more than 10% left; keeping 'work'.\n"
+        );
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn auto_step_reports_a_failure_and_carries_on() {
+        let (_home, ctx) = setup();
+        claude_accounts(&ctx);
+        let http = FakeHttp::new(|_| Err(500));
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+
+        auto_step(&ctx, &http, Tool::Claude, 10, NOW, &mut out, &mut err).unwrap();
+
+        assert!(out.is_empty());
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "2026-10-17T01:20:00Z error: could not get the usage of 'work': \
+             HTTP 500 from api.anthropic.com\n"
+        );
     }
 }
