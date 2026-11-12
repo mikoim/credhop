@@ -70,6 +70,7 @@ Sleep 2s
 
 Type "# Tab completes commands, tools and profile names" Sleep 300ms Enter
 Type "credhop u" Sleep 300ms Tab Sleep 500ms
+Type "e" Sleep 300ms Tab Sleep 500ms
 Type "cl" Sleep 300ms Tab Sleep 500ms
 Tab@300ms 2
 Sleep 1.5s
