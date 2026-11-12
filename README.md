@@ -49,13 +49,18 @@ credhop usage claude work    # one account
 
 ```text
 claude
-* work             alice@example.com  5h 77% left (resets in 2h13m)  7d 59% left (resets in 3d4h)  login expires in 24d11h
-  personal         bob@example.com    5h 100% left  7d 88% left (resets in 5d1h)  login expires in 6d2h
+  PROFILE   ACCOUNT            5H LEFT                  7D LEFT                 LOGIN
+* work      alice@example.com  ████████··  77% (2h13m)  ██████····  59% (3d4h)  24d11h
+  personal  bob@example.com    ██████████ 100%          █████████·  88% (5d1h)  6d2h
 codex
-* personal         carol@example.com  5h 90% left (resets in 4h2m)  7d 45% left (resets in 1d20h)
+  PROFILE   ACCOUNT            5H LEFT                 7D LEFT
+* personal  carol@example.com  █████████·  90% (4h2m)  █████·····  45% (1d20h)
 ```
 
-`*` marks the account you are logged in to.
+`*` marks the account you are logged in to. Each limit shows a bar of what is
+left, the percentage, then the time until it resets in parentheses. On a
+terminal, except on Windows, the bar is red at 10% or less, yellow up to 30%
+and green above; set `NO_COLOR` to turn the colors off.
 
 A Claude Code login has a time limit that refreshing the tokens does not
 extend. `list` and `usage` show how long each login has left. Once a login

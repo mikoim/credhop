@@ -11,7 +11,7 @@ use crate::http::{Http, StatusError};
 use crate::provider::{Provider, Tool, provider_for};
 use crate::store::Store;
 use crate::time::format_rfc3339;
-use crate::usage::{Usage, Window, format_duration, format_windows};
+use crate::usage::{Usage, Window, format_cell, format_duration, format_windows};
 
 /// Shown in place of the profile name of an account that is not saved.
 const UNSAVED: &str = "(unsaved)";
@@ -27,6 +27,8 @@ pub struct Ctx {
 pub enum Format {
     /// Lines for people.
     Text,
+    /// Lines for people on a terminal: `usage` colors them.
+    Color,
     /// A JSON array with one object per account, for scripts.
     Json,
 }
@@ -354,6 +356,137 @@ fn format_login(expires_at: i64, now: i64) -> String {
     }
 }
 
+/// `24d11h` or `expired 2d1h ago`, under the `LOGIN` heading of `usage`.
+fn format_login_cell(expires_at: i64, now: i64) -> String {
+    if expires_at > now {
+        format_duration(expires_at - now)
+    } else {
+        format!("expired {} ago", format_duration(now - expires_at))
+    }
+}
+
+/// A line of the table `usage` prints.
+struct TableLine {
+    /// `*` for the account logged in to.
+    marker: char,
+    /// The cells that line up in columns.
+    cells: Vec<String>,
+    /// What follows the cells without lining up, such as an error.
+    rest: String,
+}
+
+/// The table `usage` prints for the accounts of one tool: a heading, then a
+/// line for each account with a column for each usage window any of them has.
+fn usage_table(
+    provider: &dyn Provider,
+    accounts: &[((&Row, &Outcome), &Option<String>)],
+    now: i64,
+    color: bool,
+) -> Vec<TableLine> {
+    let logins: Vec<Option<i64>> = accounts
+        .iter()
+        .map(|((row, _), _)| provider.login_expires_at(&row.snapshot))
+        .collect();
+    // The windows in the order they come.
+    let mut labels: Vec<&str> = Vec::new();
+    let mut has_login = false;
+    for (((_, outcome), _), login) in accounts.iter().zip(&logins) {
+        if let Outcome::Limits(usage) = outcome {
+            for window in &usage.windows {
+                if !labels.contains(&window.label.as_str()) {
+                    labels.push(&window.label);
+                }
+            }
+            has_login |= login.is_some();
+        }
+    }
+
+    let mut heading = vec!["PROFILE".to_owned(), "ACCOUNT".to_owned()];
+    heading.extend(
+        labels
+            .iter()
+            .map(|label| format!("{} LEFT", label.to_uppercase())),
+    );
+    if has_login {
+        heading.push("LOGIN".to_owned());
+    }
+    let mut table = vec![TableLine {
+        marker: ' ',
+        cells: heading,
+        rest: String::new(),
+    }];
+    for (((row, outcome), account), login) in accounts.iter().zip(logins) {
+        let mut cells = vec![
+            row.shown_name().to_owned(),
+            account.as_deref().unwrap_or_default().to_owned(),
+        ];
+        // Without limits to show, a sentence takes the place of the columns.
+        let with_login = |sentence: String| match login {
+            Some(expires_at) => format!("{sentence}  {}", format_login(expires_at, now)),
+            None => sentence,
+        };
+        let rest = match outcome {
+            Outcome::Limits(usage) => {
+                cells.extend(labels.iter().map(|label| {
+                    let window = usage.windows.iter().find(|window| window.label == *label);
+                    window
+                        .map(|window| format_cell(window, now, color))
+                        .unwrap_or_default()
+                }));
+                cells.extend(login.map(|expires_at| format_login_cell(expires_at, now)));
+                String::new()
+            }
+            Outcome::NoLimits => with_login("no subscription limits".to_owned()),
+            Outcome::Expired => with_login(expired_token(row.tool)),
+            // An error already says what to do about the account.
+            Outcome::Failed(e) => format!("error: {e:#}"),
+        };
+        table.push(TableLine {
+            marker: if row.live { '*' } else { ' ' },
+            cells,
+            rest,
+        });
+    }
+    table
+}
+
+/// Prints `lines` with each cell padded to the width of its column.
+fn write_table(lines: &[TableLine], out: &mut dyn Write) -> Result<()> {
+    let columns = lines.iter().map(|line| line.cells.len()).max().unwrap_or(0);
+    let widths: Vec<usize> = (0..columns)
+        .map(|column| {
+            let cells = lines.iter().filter_map(|line| line.cells.get(column));
+            cells.map(|cell| shown_width(cell)).max().unwrap_or(0)
+        })
+        .collect();
+    for line in lines {
+        let mut text = format!("{} ", line.marker);
+        for (cell, &width) in line.cells.iter().zip(&widths) {
+            text.push_str(cell);
+            text.push_str(&" ".repeat(width - shown_width(cell) + 2));
+        }
+        text.push_str(&line.rest);
+        writeln!(out, "{}", text.trim_end())?;
+    }
+    Ok(())
+}
+
+/// How many characters wide `text` is on a terminal, where its color codes
+/// (from `ESC` to `m`) take no space.
+fn shown_width(text: &str) -> usize {
+    let mut width = 0;
+    let mut in_code = false;
+    for c in text.chars() {
+        match c {
+            '\x1b' => in_code = true,
+            'm' if in_code => in_code = false,
+            _ if !in_code => width += 1,
+            _ => {}
+        }
+    }
+    width
+}
+
 /// `2026-12-06T10:00:00Z`, or null when the time is unknown.
 fn json_time(unix: Option<i64>) -> Value {
     unix.map(format_rfc3339).into()
@@ -667,42 +800,18 @@ pub fn usage(
         });
         write_json(rows.collect(), out)?;
     } else {
-        let width = accounts
-            .iter()
-            .map(|account| account.as_deref().unwrap_or_default().chars().count())
-            .max()
-            .unwrap_or(0);
         for &tool in tools {
             writeln!(out, "{tool}")?;
-            let mut empty = true;
-            for ((row, outcome), account) in lines.clone() {
-                if row.tool != tool {
-                    continue;
-                }
-                empty = false;
-                let detail = match outcome {
-                    Outcome::Limits(usage) => format_windows(&usage.windows, now),
-                    Outcome::NoLimits => "no subscription limits".to_owned(),
-                    Outcome::Expired => expired_token(tool),
-                    Outcome::Failed(e) => format!("error: {e:#}"),
-                };
-                // An error already says what to do about the account.
-                let login = match outcome {
-                    Outcome::Failed(_) => None,
-                    _ => ctx.provider(tool).login_expires_at(&row.snapshot),
-                }
-                .map(|expires_at| format_login(expires_at, now))
-                .unwrap_or_default();
-                let marker = if row.live { '*' } else { ' ' };
-                let account = account.as_deref().unwrap_or_default();
-                let line = format!(
-                    "{marker} {:<16} {account:<width$}  {detail}  {login}",
-                    row.shown_name()
-                );
-                writeln!(out, "{}", line.trim_end())?;
-            }
-            if empty {
+            let lines: Vec<_> = lines
+                .clone()
+                .filter(|((row, _), _)| row.tool == tool)
+                .collect();
+            if lines.is_empty() {
                 writeln!(out, "  (no profiles)")?;
+            } else {
+                let provider = ctx.provider(tool);
+                let color = format == Format::Color;
+                write_table(&usage_table(provider.as_ref(), &lines, now, color), out)?;
             }
         }
     }
@@ -1519,8 +1628,9 @@ mod tests {
             out,
             concat!(
                 "claude\n",
-                "* personal         bob@example.com    5h 100% left (resets in 1h0m)\n",
-                "  work             alice@example.com  5h 77% left (resets in 2h13m)\n",
+                "  PROFILE   ACCOUNT            5H LEFT\n",
+                "* personal  bob@example.com    ██████████ 100% (1h0m)\n",
+                "  work      alice@example.com  ████████··  77% (2h13m)\n",
                 "codex\n",
                 "  (no profiles)\n",
             )
@@ -1561,7 +1671,11 @@ mod tests {
         assert_eq!(err.to_string(), "could not get the usage of 1 account(s)");
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "claude\n  work             alice@example.com  error: HTTP 500 from api.anthropic.com\n"
+            concat!(
+                "claude\n",
+                "  PROFILE  ACCOUNT\n",
+                "  work     alice@example.com  error: HTTP 500 from api.anthropic.com\n",
+            )
         );
         assert_eq!(profile_token(&ctx, "work"), "a2");
         let profile = ctx
@@ -1617,7 +1731,7 @@ mod tests {
         assert_eq!(err.to_string(), "could not get the usage of 1 account(s)");
         let out = String::from_utf8(out).unwrap();
         let detail = out
-            .strip_prefix("claude\n  work             alice@example.com  error: ")
+            .strip_prefix("claude\n  PROFILE  ACCOUNT\n  work     alice@example.com  error: ")
             .unwrap();
         assert!(
             detail.starts_with("tokens were refreshed but saving the profile failed: "),
@@ -1649,7 +1763,11 @@ mod tests {
 
         assert_eq!(
             out,
-            "claude\n* work             alice@example.com  access token expired; run claude to refresh it\n"
+            concat!(
+                "claude\n",
+                "  PROFILE  ACCOUNT\n",
+                "* work     alice@example.com  access token expired; run claude to refresh it\n",
+            )
         );
         assert!(http.requests().is_empty());
     }
@@ -1681,8 +1799,9 @@ mod tests {
             String::from_utf8(out).unwrap(),
             concat!(
                 "claude\n",
-                "  team             bob@example.com    error: unauthorized (HTTP 401 from api.anthropic.com); log in to this account again\n",
-                "  work             alice@example.com  5h 50% left (resets in 1m)\n",
+                "  PROFILE  ACCOUNT            5H LEFT\n",
+                "  team     bob@example.com    error: unauthorized (HTTP 401 from api.anthropic.com); log in to this account again\n",
+                "  work     alice@example.com  █████·····  50% (1m)\n",
             )
         );
     }
@@ -1707,7 +1826,11 @@ mod tests {
 
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "claude\n  work             alice@example.com  error: token refresh failed (HTTP 400); log in to this account again and run `credhop save claude work --force`\n"
+            concat!(
+                "claude\n",
+                "  PROFILE  ACCOUNT\n",
+                "  work     alice@example.com  error: token refresh failed (HTTP 400); log in to this account again and run `credhop save claude work --force`\n",
+            )
         );
         assert_eq!(profile_token(&ctx, "work"), "a1");
     }
@@ -1732,8 +1855,9 @@ mod tests {
             )),
             concat!(
                 "claude\n",
-                "* (unsaved)        carol@example.com  5h 100% left (resets in 1m)\n",
-                "  work             alice@example.com  5h 100% left (resets in 1m)\n",
+                "  PROFILE    ACCOUNT            5H LEFT\n",
+                "* (unsaved)  carol@example.com  ██████████ 100% (1m)\n",
+                "  work       alice@example.com  ██████████ 100% (1m)\n",
             )
         );
         assert_eq!(
@@ -1746,7 +1870,11 @@ mod tests {
                 Format::Text,
                 out
             )),
-            "claude\n  work             alice@example.com  5h 100% left (resets in 1m)\n"
+            concat!(
+                "claude\n",
+                "  PROFILE  ACCOUNT            5H LEFT\n",
+                "  work     alice@example.com  ██████████ 100% (1m)\n",
+            )
         );
     }
 
@@ -1772,9 +1900,10 @@ mod tests {
             )),
             concat!(
                 "claude\n",
-                "  old              carol@example.com  5h 50% left (resets in 1m)  login expired 1h0m ago\n",
-                "  team             bob@example.com    5h 50% left (resets in 1m)\n",
-                "  work             alice@example.com  5h 50% left (resets in 1m)  login expires in 24d11h\n",
+                "  PROFILE  ACCOUNT            5H LEFT               LOGIN\n",
+                "  old      carol@example.com  █████·····  50% (1m)  expired 1h0m ago\n",
+                "  team     bob@example.com    █████·····  50% (1m)\n",
+                "  work     alice@example.com  █████·····  50% (1m)  24d11h\n",
             )
         );
     }
@@ -1801,7 +1930,11 @@ mod tests {
         assert_eq!(err.to_string(), "could not get the usage of 1 account(s)");
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "claude\n  work             alice@example.com  error: login expired 2d1h ago; log in to this account again and run `credhop save claude work --force`\n"
+            concat!(
+                "claude\n",
+                "  PROFILE  ACCOUNT\n",
+                "  work     alice@example.com  error: login expired 2d1h ago; log in to this account again and run `credhop save claude work --force`\n",
+            )
         );
         assert!(http.requests().is_empty());
     }
@@ -1830,7 +1963,11 @@ mod tests {
         assert_eq!(err.to_string(), "could not get the usage of 1 account(s)");
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "claude\n* work             alice@example.com  error: login expired 1h0m ago; log in to this account again\n"
+            concat!(
+                "claude\n",
+                "  PROFILE  ACCOUNT\n",
+                "* work     alice@example.com  error: login expired 1h0m ago; log in to this account again\n",
+            )
         );
         assert!(http.requests().is_empty());
     }
@@ -1847,9 +1984,79 @@ mod tests {
 
         assert_eq!(
             output(|out| usage(&ctx, &http, Some(Tool::Codex), None, NOW, Format::Text, out)),
-            "codex\n  apikey           API key (****abcd)  no subscription limits\n"
+            concat!(
+                "codex\n",
+                "  PROFILE  ACCOUNT\n",
+                "  apikey   API key (****abcd)  no subscription limits\n",
+            )
         );
         assert!(http.requests().is_empty());
+    }
+
+    #[test]
+    fn usage_gives_each_window_a_column_and_leaves_missing_ones_blank() {
+        let (_home, ctx) = setup();
+        save_claude_profile(&ctx, "work", "alice", "a1", NOW + 3600);
+        save_claude_profile(&ctx, "team", "bob", "b1", NOW + 3600);
+        end_profile_login(&ctx, "work", NOW + 3 * 86_400);
+        let limit = |group: &str, percent: u32, resets_in: i64| json!({"group": group, "percent": percent, "resets_at": format_rfc3339(NOW + resets_in)});
+        let http = FakeHttp::new(move |request| match request.header("Authorization") {
+            Some("Bearer a1") => Ok(json!({"limits": [limit("weekly", 41, 86_400)]})),
+            _ => Ok(json!({"limits": [
+                limit("session", 92, 1800),
+                limit("weekly", 0, 6 * 86_400),
+                {"group": "weekly", "percent": 31, "scope": {"model": {"display_name": "Fable"}}},
+            ]})),
+        });
+
+        assert_eq!(
+            output(|out| usage(
+                &ctx,
+                &http,
+                Some(Tool::Claude),
+                None,
+                NOW,
+                Format::Text,
+                out
+            )),
+            concat!(
+                "claude\n",
+                "  PROFILE  ACCOUNT            5H LEFT                7D LEFT                 7D FABLE LEFT    LOGIN\n",
+                "  team     bob@example.com    █·········   8% (30m)  ██████████ 100% (6d0h)  ███████···  69%\n",
+                "  work     alice@example.com                         ██████····  59% (1d0h)                   3d0h\n",
+            )
+        );
+    }
+
+    #[test]
+    fn usage_colors_the_limits_for_a_terminal_and_still_lines_them_up() {
+        let (_home, ctx) = setup();
+        save_claude_profile(&ctx, "work", "alice", "a1", NOW + 3600);
+        save_claude_profile(&ctx, "team", "bob", "b1", NOW + 3600);
+        end_profile_login(&ctx, "work", NOW + 3 * 86_400);
+        end_profile_login(&ctx, "team", NOW + 86_400);
+        let http = FakeHttp::new(|request| match request.header("Authorization") {
+            Some("Bearer a1") => Ok(session_usage(23, 7980)),
+            _ => Ok(session_usage(95, 60)),
+        });
+
+        assert_eq!(
+            output(|out| usage(
+                &ctx,
+                &http,
+                Some(Tool::Claude),
+                None,
+                NOW,
+                Format::Color,
+                out
+            )),
+            concat!(
+                "claude\n",
+                "  PROFILE  ACCOUNT            5H LEFT                  LOGIN\n",
+                "  team     bob@example.com    \x1b[31m█·········   5%\x1b[0m (1m)     1d0h\n",
+                "  work     alice@example.com  \x1b[32m████████··  77%\x1b[0m (2h13m)  3d0h\n",
+            )
+        );
     }
 
     /// Parses what a command printed with `Format::Json`.

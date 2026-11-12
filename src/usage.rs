@@ -1,4 +1,4 @@
-//! Subscription usage limits and how `credhop usage` prints them.
+//! Subscription usage limits and how `credhop usage` and `credhop auto` print them.
 
 /// One usage limit window, such as the 5-hour or the weekly limit.
 #[derive(Debug, Clone, PartialEq)]
@@ -25,6 +25,9 @@ impl Usage {
     }
 }
 
+/// How many characters wide the bar of a table cell is.
+const BAR_WIDTH: usize = 10;
+
 /// How much of the limit is left, as a whole percentage from 0 to 100.
 fn left_percent(window: &Window) -> i64 {
     // The cast also turns a rounded -0.0 into 0.
@@ -42,15 +45,46 @@ pub fn format_windows(windows: &[Window], now: i64) -> String {
 
 fn format_window(window: &Window, now: i64) -> String {
     let mut text = format!("{} {}% left", window.label, left_percent(window));
-    if let Some(resets_at) = window.resets_at
-        && resets_at > now
-    {
-        text.push_str(&format!(
-            " (resets in {})",
-            format_duration(resets_at - now)
-        ));
+    if let Some(resets_in) = resets_in(window, now) {
+        text.push_str(&format!(" (resets in {resets_in})"));
     }
     text
+}
+
+/// `████████··  77% (2h13m)`: a bar of how much of `window` is left, the
+/// percentage and the time to its reset, for a table column. With `color`, the
+/// bar and the percentage are red, yellow or green by how much is left.
+pub fn format_cell(window: &Window, now: i64, color: bool) -> String {
+    let left = left_percent(window);
+    // Rounded up, so that anything left shows.
+    let filled = (left as usize * BAR_WIDTH).div_ceil(100);
+    let empty = BAR_WIDTH - filled;
+    let mut text = format!("{}{} {left:>3}%", "█".repeat(filled), "·".repeat(empty));
+    if color {
+        text = format!("\x1b[{}m{text}\x1b[0m", color_code(left));
+    }
+    if let Some(resets_in) = resets_in(window, now) {
+        text.push_str(&format!(" ({resets_in})"));
+    }
+    text
+}
+
+/// The ANSI color of a limit with `left` percent left: red at 10 or less,
+/// where `auto` switches by default, yellow up to 30 and green above.
+fn color_code(left: i64) -> u8 {
+    match left {
+        ..=10 => 31,
+        11..=30 => 33,
+        _ => 32,
+    }
+}
+
+/// The time until `window` resets, such as `2h13m`, unless it is unknown or past.
+fn resets_in(window: &Window, now: i64) -> Option<String> {
+    window
+        .resets_at
+        .filter(|&resets_at| resets_at > now)
+        .map(|resets_at| format_duration(resets_at - now))
 }
 
 /// `3d4h`, `2h13m`, `45m` or `<1m`.
@@ -144,5 +178,32 @@ mod tests {
             "5h 50% left"
         );
         assert_eq!(format_windows(&[], now), "");
+    }
+
+    #[test]
+    fn cells_draw_a_bar_of_what_is_left_before_the_percentage_and_the_time_to_reset() {
+        let now = 1_000_000;
+        let cell = |used, resets_at| format_cell(&window("5h", used, resets_at), now, false);
+
+        assert_eq!(cell(23.4, Some(now + 7980)), "████████··  77% (2h13m)");
+        assert_eq!(cell(0.0, Some(now + 60)), "██████████ 100% (1m)");
+        assert_eq!(cell(99.0, None), "█·········   1%"); // anything left shows
+        assert_eq!(cell(100.0, None), "··········   0%");
+        assert_eq!(cell(50.0, Some(now)), "█████·····  50%"); // a past reset time is omitted
+    }
+
+    #[test]
+    fn cells_are_colored_by_how_much_is_left() {
+        let now = 1_000_000;
+        let cell =
+            |left: f64, resets_at| format_cell(&window("5h", 100.0 - left, resets_at), now, true);
+
+        assert_eq!(cell(10.0, None), "\x1b[31m█·········  10%\x1b[0m");
+        assert_eq!(cell(11.0, None), "\x1b[33m██········  11%\x1b[0m");
+        assert_eq!(cell(30.0, None), "\x1b[33m███·······  30%\x1b[0m");
+        assert_eq!(
+            cell(31.0, Some(now + 60)),
+            "\x1b[32m████······  31%\x1b[0m (1m)"
+        );
     }
 }

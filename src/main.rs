@@ -12,6 +12,7 @@ mod store;
 mod time;
 mod usage;
 
+use std::io::IsTerminal;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -139,15 +140,21 @@ fn main() -> Result<()> {
         Command::Remove { tool, name } => commands::remove(&ctx, tool, &name, &mut out),
         Command::Rename { tool, old, new } => commands::rename(&ctx, tool, &old, &new, &mut out),
         Command::Status { json } => commands::status(&ctx, format(json), &mut out),
-        Command::Usage { tool, name, json } => commands::usage(
-            &ctx,
-            &Ureq::default(),
-            tool,
-            name.as_deref(),
-            unix_now()?,
-            format(json),
-            &mut out,
-        ),
+        Command::Usage { tool, name, json } => {
+            let format = match format(json) {
+                Format::Text if shows_colors(&out) => Format::Color,
+                format => format,
+            };
+            commands::usage(
+                &ctx,
+                &Ureq::default(),
+                tool,
+                name.as_deref(),
+                unix_now()?,
+                format,
+                &mut out,
+            )
+        }
         Command::Auto {
             tool,
             threshold,
@@ -178,6 +185,15 @@ fn main() -> Result<()> {
 /// The output format `--json` selects.
 fn format(json: bool) -> Format {
     if json { Format::Json } else { Format::Text }
+}
+
+/// Whether to color what is written to `out`: on a terminal, unless
+/// `NO_COLOR` is set. Never on Windows, where a console prints the color codes
+/// as text unless the program turns them on first.
+fn shows_colors(out: &impl IsTerminal) -> bool {
+    !cfg!(windows)
+        && out.is_terminal()
+        && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
 }
 
 /// Parses the interval of `auto --watch`: a number and `s`, `m` or `h`.
